@@ -1,0 +1,88 @@
+
+
+services:
+  # ─── Python Vision Backend ─────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: anilog-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - anilog-data:/app/data
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - OLLAMA_HOST=http://ollama:11434
+      - ZMQ_CAPTURE_PORT=5555
+      - ZMQ_RESULT_PORT=5556
+    depends_on:
+      - chromadb
+    networks:
+      - anilog-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ─── ChromaDB Vector Database ──────────────────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: anilog-chromadb
+    ports:
+      - "8100:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - ANONYMIZED_TELEMETRY=false
+      - IS_PERSISTENT=TRUE
+    networks:
+      - anilog-net
+
+  # ─── Ollama Local LLM ─────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: anilog-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - anilog-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ─── Next.js Frontend ──────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: anilog-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - anilog-net
+
+volumes:
+  anilog-data:
+  chroma-data:
+  ollama-data:
+
+networks:
+  anilog-net:
+    driver: bridge
