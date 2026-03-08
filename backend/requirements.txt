@@ -1,0 +1,45 @@
+# FastAPI + Vision Pipeline
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-dotenv==1.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.25
+aiosqlite==0.19.0
+chromadb==0.4.22
+
+# Vision / ML
+ultralytics==8.1.0
+torch==2.2.0
+torchvision==0.17.0
+open-clip-torch==2.24.0
+Pillow==10.2.0
+opencv-python-headless==4.9.0.80
+numpy==1.26.3
+scipy==1.12.0
+scikit-learn==1.4.0
+
+# Tracking
+supervision==0.18.0
+lap==0.4.0
+
+# Screen Capture (Python fallback)
+mss==9.0.1
+
+# IPC
+pyzmq==25.1.2
+
+# LLM
+ollama==0.1.6
+httpx==0.26.0
+
+# Background Tasks
+celery[redis]==5.3.6
+redis==5.0.1
+
+# Utilities
+loguru==0.7.2
+orjson==3.9.12
