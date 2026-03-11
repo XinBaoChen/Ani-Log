@@ -103,7 +103,12 @@ cd frontend
 npm install
 npm run dev
 ```
+# Backend
+cd backend
+python mock_server.py
 
+
+Have both frontend and backend running to see the full experience.
 ### Service URLs
 
 | Service | URL |

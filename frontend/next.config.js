@@ -1,5 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Prevent Next.js from issuing 308 redirects on /api/* trailing slashes
+  // (the backend defines some routes with trailing slashes like /api/sessions/)
+  skipTrailingSlashRedirect: true,
   images: {
     remotePatterns: [
       {

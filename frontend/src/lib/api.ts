@@ -68,7 +68,7 @@ export const api = {
   getScene: (id: string) => request<Scene>(`/api/scenes/${id}`),
 
   // ─── Sessions ───────────────────────────────────────────
-  getSessions: () => request<Session[]>("/api/sessions/"),
+  getSessions: () => request<Session[]>("/api/sessions"),
 
   getSession: (id: string) => request<Session>(`/api/sessions/${id}`),
 

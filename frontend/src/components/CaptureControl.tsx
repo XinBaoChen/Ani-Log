@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Play, Square, Loader2 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Play, Square, Loader2, ExternalLink } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useCaptureStore } from "@/store/useCaptureStore";
 import { api } from "@/lib/api";
@@ -14,7 +15,9 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
   const { status, setStatus, setStats, setSessionId } = useCaptureStore();
   const [title, setTitle] = useState("My Anime Session");
   const [fps, setFps] = useState(2);
+  const [lastSessionId, setLastSessionId] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const router = useRouter();
 
   // On mount: reconcile store with real backend state so stale "capturing"
   // left over from a previous session / server restart doesn't lock the UI.
@@ -56,6 +59,9 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
   };
 
   const handleStop = async () => {
+    // Save session ID before clearing so we can navigate to it
+    const capturedSessionId = useCaptureStore.getState().sessionId;
+
     // Optimistically reset UI immediately
     setStatus("idle");
     setSessionId(null);
@@ -69,6 +75,11 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
       if (!msg.includes("400")) {
         console.error("Failed to stop capture:", err);
       }
+    }
+
+    // Remember last session so user can navigate to view it
+    if (capturedSessionId) {
+      setLastSessionId(capturedSessionId);
     }
   };
 
@@ -204,6 +215,16 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
             <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
             Capturing...
           </span>
+        )}
+
+        {status === "idle" && lastSessionId && (
+          <button
+            onClick={() => router.push(`/sessions/${lastSessionId}`)}
+            className="flex items-center gap-2 text-sm text-primary-400 hover:text-primary-300 transition-colors"
+          >
+            <ExternalLink className="w-4 h-4" />
+            View Last Session
+          </button>
         )}
       </div>
     </div>

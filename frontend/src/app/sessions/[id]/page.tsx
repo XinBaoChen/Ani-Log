@@ -300,7 +300,15 @@ export default function SessionDetailPage() {
   if (error)
     return (
       <div className="max-w-2xl mx-auto px-6 py-16 text-center">
-        <p className="text-red-400 mb-4">{error}</p>
+        <Film className="w-12 h-12 mx-auto mb-4 text-surface-700" />
+        <p className="text-red-400 mb-2">
+          {error.includes("404") ? "Session not found" : error}
+        </p>
+        <p className="text-sm text-surface-500 mb-6">
+          {error.includes("404")
+            ? "This session may have been deleted or the server was restarted."
+            : "Something went wrong while loading this session."}
+        </p>
         <button onClick={() => router.push("/sessions")} className="text-sm text-primary-400 hover:underline">
           Back to sessions
         </button>
