@@ -14,6 +14,8 @@ import {
   Clock,
   Loader2,
   Trash2,
+  Maximize,
+  Minimize,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Session, Scene } from "@/types";
@@ -64,6 +66,9 @@ export default function SessionDetailPage() {
   const [preloaded, setPreloaded] = useState(0);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [autoplayDone, setAutoplayDone] = useState(false);
+  const viewerContainerRef = useRef<HTMLDivElement>(null);
 
   const scenesRef     = useRef<Scene[]>([]);
   const currentRef    = useRef(0);
@@ -101,20 +106,34 @@ export default function SessionDetailPage() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Preload every scene image into browser cache
+  // Preload scene images — prioritise first few for fast initial display
   useEffect(() => {
     if (scenes.length === 0) return;
     cacheRef.current.clear();
     setPreloaded(0);
+    setAutoplayDone(false);
     let done = 0;
-    scenes.forEach((sc, i) => {
-      const src = thumb(sc.thumbnail_url);
+    const total = scenes.length;
+
+    const loadOne = (i: number) => {
+      const src = thumb(scenes[i]?.thumbnail_url);
       if (!src) { done++; setPreloaded(done); return; }
       const img = new Image();
+      img.decoding = "async";
       img.onload = img.onerror = () => { done++; setPreloaded(done); };
       img.src = src;
       cacheRef.current.set(i, img);
-    });
+    };
+
+    // Load first 4 immediately for fast start, rest in batches
+    const BATCH = Math.min(4, total);
+    for (let i = 0; i < BATCH; i++) loadOne(i);
+    // Load remaining after a microtask so first frames render sooner
+    if (total > BATCH) {
+      queueMicrotask(() => {
+        for (let i = BATCH; i < total; i++) loadOne(i);
+      });
+    }
   }, [scenes]);
 
   // Draw a frame onto the canvas — drawImage on a preloaded HTMLImageElement is instant
@@ -133,7 +152,36 @@ export default function SessionDetailPage() {
     } else {
       // Fallback while preloading
       const src = thumb(scenesRef.current[idx]?.thumbnail_url);
-      if (!src) return;
+      if (!src) {
+        // No thumbnail — draw a placeholder on the canvas
+        const sc = scenesRef.current[idx];
+        const w = 640, h = 360;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          // Dark gradient background
+          const grad = ctx.createLinearGradient(0, 0, 0, h);
+          grad.addColorStop(0, "#1e1b4b");
+          grad.addColorStop(1, "#0f0a1a");
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, w, h);
+          // Scene label
+          ctx.fillStyle = "rgba(255,255,255,0.7)";
+          ctx.font = "bold 24px sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(`Scene ${(sc?.scene_index ?? idx) + 1}`, w / 2, h / 2 - 10);
+          if (sc?.description) {
+            ctx.fillStyle = "rgba(255,255,255,0.4)";
+            ctx.font = "14px sans-serif";
+            const desc = sc.description.length > 60 ? sc.description.slice(0, 57) + "…" : sc.description;
+            ctx.fillText(desc, w / 2, h / 2 + 20);
+          }
+        }
+        return;
+      }
       const img = new Image();
       img.onload = () => {
         if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
@@ -228,6 +276,34 @@ export default function SessionDetailPage() {
     startRaf();
   }, [startRaf]);
 
+  // ── Autoplay: start playback once all frames are preloaded ──
+  useEffect(() => {
+    if (autoplayDone) return;
+    if (scenes.length >= 2 && preloaded >= scenes.length) {
+      setAutoplayDone(true);
+      // Small delay so the first frame renders before playback starts
+      const t = setTimeout(() => play(), 120);
+      return () => clearTimeout(t);
+    }
+  }, [preloaded, scenes.length, autoplayDone, play]);
+
+  // ── Fullscreen toggle ──
+  const toggleFullscreen = useCallback(() => {
+    const el = viewerContainerRef.current;
+    if (!el) return;
+    if (!document.fullscreenElement) {
+      el.requestFullscreen?.().catch(() => {});
+    } else {
+      document.exitFullscreen?.().catch(() => {});
+    }
+  }, []);
+
+  useEffect(() => {
+    const handler = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", handler);
+    return () => document.removeEventListener("fullscreenchange", handler);
+  }, []);
+
   const pause = useCallback(() => {
     playingRef.current = false;
     setPlaying(false);
@@ -285,10 +361,14 @@ export default function SessionDetailPage() {
       if (e.key === "ArrowLeft")  prev();
       if (e.key === "ArrowRight") next();
       if (e.key === " ") { e.preventDefault(); togglePlay(); }
+      if (e.key === "f" || e.key === "F") toggleFullscreen();
+      if (e.key === "Escape" && document.fullscreenElement) {
+        document.exitFullscreen?.().catch(() => {});
+      }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [prev, next, togglePlay]);
+  }, [prev, next, togglePlay, toggleFullscreen]);
 
   if (loading)
     return (
@@ -320,7 +400,7 @@ export default function SessionDetailPage() {
   const allLoaded = preloaded >= scenes.length;
 
   return (
-    <div className="flex flex-col bg-black" style={{ height: "calc(100vh - 4rem)" }}>
+    <div ref={viewerContainerRef} className="flex flex-col bg-black" style={{ height: isFullscreen ? "100vh" : "calc(100vh - 4rem)" }}>
 
       {/* Top bar */}
       <div className="flex items-center gap-3 px-4 py-2 border-b border-surface-800 bg-surface-950 shrink-0">
@@ -350,6 +430,13 @@ export default function SessionDetailPage() {
           </span>
 
           {/* Delete button */}
+          <button
+            onClick={toggleFullscreen}
+            title={isFullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-surface-400 border border-surface-700 hover:bg-surface-800 hover:text-white transition-all"
+          >
+            {isFullscreen ? <Minimize className="w-3.5 h-3.5" /> : <Maximize className="w-3.5 h-3.5" />}
+          </button>
           {!confirmDelete ? (
             <button
               onClick={() => setConfirmDelete(true)}
@@ -489,7 +576,14 @@ export default function SessionDetailPage() {
                 }`}>
                 {loop ? "↺ On" : "↺ Off"}
               </button>
-              <span className="hidden lg:block text-xs text-surface-700 ml-2 select-none">← → Space</span>
+              <button
+                onClick={toggleFullscreen}
+                title={isFullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"}
+                className="p-1.5 rounded text-surface-400 hover:text-white hover:bg-surface-800 transition-all ml-1"
+              >
+                {isFullscreen ? <Minimize className="w-4 h-4" /> : <Maximize className="w-4 h-4" />}
+              </button>
+              <span className="hidden lg:block text-xs text-surface-700 ml-2 select-none">← → Space F</span>
             </div>
 
             {scenes.length > 1 && (
