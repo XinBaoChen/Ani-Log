@@ -732,7 +732,6 @@ def placeholder_image(scene_index: int, w: int = Query(640), h: int = Query(360)
 
 @app.get("/data/{path:path}")
 def serve_data(path: str):
-    raise HTTPException(404, "No thumbnail available in mock server")
     """Serve captured screenshots and other session data from disk."""
     file_path = pathlib.Path(__file__).parent / "data" / path
     if not file_path.exists() or not file_path.is_file():
