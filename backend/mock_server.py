@@ -10,25 +10,29 @@ Usage:
     # or: uvicorn mock_server:app --reload --port 8000
 """
 
+import io
+import os
 import uuid
 import time
+import struct
+import zlib
+import threading
+import pathlib
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-
-app = FastAPI(title="Ani-Log Mock API", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+import mss
+import mss.tools
+from PIL import Image
 
 # ── In-memory state ────────────────────────────────────────────────────────────
+
+DATA_DIR = pathlib.Path(__file__).parent / "data" / "sessions"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 _capture_state = {
     "session_id": None,
@@ -39,6 +43,9 @@ _capture_state = {
     "started_at": None,
 }
 
+_capture_thread: Optional[threading.Thread] = None
+_capture_stop_event = threading.Event()
+
 _sessions = [
     {
         "id": "sess-001",
@@ -47,7 +54,8 @@ _sessions = [
         "started_at": "2026-03-01T14:00:00Z",
         "ended_at":   "2026-03-01T14:47:22Z",
         "total_frames": 2834,
-        "thumbnail_url": None,
+        "scene_count": 3,
+        "first_thumbnail_url": "/api/placeholder/0?w=640&h=360",
     },
     {
         "id": "sess-002",
@@ -56,7 +64,8 @@ _sessions = [
         "started_at": "2026-03-02T20:15:00Z",
         "ended_at":   "2026-03-02T22:03:11Z",
         "total_frames": 6541,
-        "thumbnail_url": None,
+        "scene_count": 2,
+        "first_thumbnail_url": "/api/placeholder/3?w=640&h=360",
     },
     {
         "id": "sess-003",
@@ -65,7 +74,8 @@ _sessions = [
         "started_at": "2026-03-03T18:30:00Z",
         "ended_at":   "2026-03-03T19:52:44Z",
         "total_frames": 4102,
-        "thumbnail_url": None,
+        "scene_count": 1,
+        "first_thumbnail_url": "/api/placeholder/5?w=640&h=360",
     },
 ]
 
@@ -151,7 +161,7 @@ _scenes = [
         "scene_index": 0,
         "start_time": 62.0,
         "end_time": 198.0,
-        "thumbnail_url": None,
+        "thumbnail_url": "/api/placeholder/0?w=640&h=360",
         "description": "Levi and his squad infiltrate Wall Maria through heavy fog at dawn.",
         "location": "Wall Maria — outer district",
         "characters": [_characters[0], _characters[1]],
@@ -165,7 +175,7 @@ _scenes = [
         "scene_index": 1,
         "start_time": 198.0,
         "end_time": 334.5,
-        "thumbnail_url": None,
+        "thumbnail_url": "/api/placeholder/1?w=640&h=360",
         "description": "Armin lays out the plan on a map as the cadets prepare for the counterattack.",
         "location": "Trost District — command room",
         "characters": [_characters[2], _characters[3]],
@@ -179,7 +189,7 @@ _scenes = [
         "scene_index": 2,
         "start_time": 334.5,
         "end_time": 487.0,
-        "thumbnail_url": None,
+        "thumbnail_url": "/api/placeholder/2?w=640&h=360",
         "description": "Historia reveals her true identity to Ymir as they flee through the underground caverns.",
         "location": "Underground city passage",
         "characters": [_characters[4]],
@@ -191,7 +201,7 @@ _scenes = [
         "scene_index": 0,
         "start_time": 12.0,
         "end_time": 165.0,
-        "thumbnail_url": None,
+        "thumbnail_url": "/api/placeholder/3?w=640&h=360",
         "description": "The Mugen Train accelerates through the night as passengers fall into enchanted sleep.",
         "location": "Mugen Train — exterior",
         "characters": [],
@@ -205,7 +215,7 @@ _scenes = [
         "scene_index": 1,
         "start_time": 165.0,
         "end_time": 391.0,
-        "thumbnail_url": None,
+        "thumbnail_url": "/api/placeholder/4?w=640&h=360",
         "description": "A massive castle silhouette looms over the next village. Drums can be heard in the distance.",
         "location": "Castle courtyard at dusk",
         "characters": [],
@@ -217,7 +227,7 @@ _scenes = [
         "scene_index": 0,
         "start_time": 30.0,
         "end_time": 214.0,
-        "thumbnail_url": None,
+        "thumbnail_url": "/api/placeholder/5?w=640&h=360",
         "description": "Students spar at a school in Shibuya — Gojo arrives late wearing a blindfold.",
         "location": "Jujutsu High — training grounds",
         "characters": [],
@@ -247,6 +257,16 @@ _story_arcs = [
 ]
 
 # ── Pydantic request models ────────────────────────────────────────────────────
+
+app = FastAPI(title="Ani-Log Mock API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class CaptureStartRequest(BaseModel):
     title: str = "My Session"
@@ -285,8 +305,9 @@ def get_capture_status():
         elapsed = int(time.time() - _capture_state["started_at"])
         if _capture_state["status"] == "capturing":
             _capture_state["total_frames"] = elapsed * _capture_state.get("fps", 2)
-            _capture_state["scenes_detected"] = max(0, elapsed // 30)
-            _capture_state["characters_found"] = min(8, elapsed // 20)
+            # Detect first scene immediately, then one every ~10 seconds
+            _capture_state["scenes_detected"] = max(1, elapsed // 10)
+            _capture_state["characters_found"] = min(8, max(1, elapsed // 8))
 
     return {
         "session_id": _capture_state["session_id"] or "",
@@ -297,8 +318,43 @@ def get_capture_status():
         "elapsed_seconds": elapsed,
     }
 
+def _capture_loop(session_id: str, fps: int, stop_event: threading.Event):
+    """Background thread: captures the screen using mss at the given FPS."""
+    session_dir = DATA_DIR / session_id / "scenes"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    interval = 1.0 / max(fps, 1)
+    frame_idx = 0
+
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]  # primary monitor
+        while not stop_event.is_set():
+            t0 = time.monotonic()
+            try:
+                raw = sct.grab(monitor)
+                img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                # Resize to reasonable web size (max 1280 wide)
+                if img.width > 1280:
+                    ratio = 1280 / img.width
+                    img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
+                path = session_dir / f"scene_{frame_idx:04d}.jpg"
+                img.save(str(path), "JPEG", quality=85)
+                frame_idx += 1
+                _capture_state["total_frames"] = frame_idx
+                _capture_state["scenes_detected"] = frame_idx
+            except Exception as e:
+                print(f"[capture] frame {frame_idx} error: {e}")
+
+            # Sleep for remaining interval
+            elapsed = time.monotonic() - t0
+            sleep_time = interval - elapsed
+            if sleep_time > 0:
+                stop_event.wait(sleep_time)
+
+
 @app.post("/api/capture/start")
 def start_capture(req: CaptureStartRequest):
+    global _capture_thread
     if _capture_state["status"] == "capturing":
         raise HTTPException(400, "Capture session already running")
 
@@ -310,7 +366,8 @@ def start_capture(req: CaptureStartRequest):
         "started_at": _now(),
         "ended_at": None,
         "total_frames": 0,
-        "thumbnail_url": None,
+        "scene_count": 0,
+        "first_thumbnail_url": None,
     }
     _sessions.insert(0, new_session)
 
@@ -324,6 +381,15 @@ def start_capture(req: CaptureStartRequest):
         "fps": req.fps,
     })
 
+    # Launch real screen capture in background thread
+    _capture_stop_event.clear()
+    _capture_thread = threading.Thread(
+        target=_capture_loop,
+        args=(session_id, req.fps, _capture_stop_event),
+        daemon=True,
+    )
+    _capture_thread.start()
+
     return {
         "session_id": session_id,
         "status": "capturing",
@@ -332,15 +398,33 @@ def start_capture(req: CaptureStartRequest):
 
 @app.post("/api/capture/stop")
 def stop_capture():
+    global _capture_thread
     if _capture_state["status"] != "capturing":
         raise HTTPException(400, "No active capture session")
 
+    # Stop the capture thread
+    _capture_stop_event.set()
+    if _capture_thread and _capture_thread.is_alive():
+        _capture_thread.join(timeout=3)
+    _capture_thread = None
+
     sid = _capture_state["session_id"]
+    elapsed = int(time.time() - _capture_state["started_at"]) if _capture_state["started_at"] else 0
+    total_frames = _capture_state["total_frames"]
+    fps = _capture_state.get("fps", 2)
+
+    # Build scene entries from actual captured screenshots
+    _generate_real_scenes(sid, total_frames, fps)
+
     for s in _sessions:
         if s["id"] == sid:
             s["status"] = "stopped"
             s["ended_at"] = _now()
-            s["total_frames"] = _capture_state["total_frames"]
+            s["total_frames"] = total_frames
+            scene_count = len([sc for sc in _scenes if sc["session_id"] == sid])
+            s["scene_count"] = scene_count
+            if scene_count > 0:
+                s["first_thumbnail_url"] = f"/data/sessions/{sid}/scenes/scene_0000.jpg"
             break
 
     _capture_state.update({
@@ -349,7 +433,38 @@ def stop_capture():
         "started_at": None,
     })
 
-    return {"status": "stopped", "message": "Capture session stopped"}
+    return {"status": "stopped", "message": f"Capture stopped — {total_frames} frames saved"}
+
+
+def _generate_real_scenes(session_id: str, total_frames: int, fps: int):
+    """Create scene entries from actual captured screenshots on disk."""
+    session_dir = DATA_DIR / session_id / "scenes"
+    if not session_dir.exists():
+        return
+
+    # List all captured JPEG files sorted by name
+    files = sorted(session_dir.glob("scene_*.jpg"))
+    if not files:
+        return
+
+    interval = 1.0 / max(fps, 1)  # seconds between frames
+
+    for i, fpath in enumerate(files):
+        scene_id = str(uuid.uuid4())
+        start_time = i * interval
+        end_time = (i + 1) * interval
+        _scenes.append({
+            "id": scene_id,
+            "session_id": session_id,
+            "scene_index": i,
+            "start_time": start_time,
+            "end_time": end_time,
+            "thumbnail_url": f"/data/sessions/{session_id}/scenes/{fpath.name}",
+            "description": f"Screen capture frame {i + 1}",
+            "location": "Desktop",
+            "characters": [],
+            "items": [],
+        })
 
 # ── Routes — Characters ───────────────────────────────────────────────────────
 
@@ -419,6 +534,8 @@ def get_session(session_id: str):
     session = next((s for s in _sessions if s["id"] == session_id), None)
     if not session:
         raise HTTPException(404, "Session not found")
+    # Always include scene_count based on actual scenes
+    session["scene_count"] = len([sc for sc in _scenes if sc["session_id"] == session_id])
     return session
 
 @app.get("/api/sessions/{session_id}/scenes")
@@ -516,11 +633,116 @@ def generate_summary(req: SummaryGenerateRequest):
     _story_arcs.append(new_arc)
     return new_arc
 
-# ── Static data dir stub ──────────────────────────────────────────────────────
+# ── Placeholder image generator ───────────────────────────────────────────────
+
+# Anime-inspired color palette for scene placeholders
+_SCENE_COLORS = [
+    (75, 0, 130),    # deep indigo
+    (139, 0, 0),     # dark red
+    (0, 100, 0),     # dark green
+    (25, 25, 112),   # midnight blue
+    (128, 0, 128),   # purple
+    (139, 69, 19),   # saddle brown
+    (0, 128, 128),   # teal
+    (72, 61, 139),   # dark slate blue
+    (178, 34, 34),   # firebrick
+    (47, 79, 79),    # dark slate gray
+]
+
+def _make_png(width: int, height: int, r: int, g: int, b: int,
+              label: str = "", sub: str = "") -> bytes:
+    """Generate a minimal PNG image with a gradient background and text overlay.
+    
+    Pure Python — no Pillow/PIL dependency.
+    Creates a simple gradient with a darker bottom for cinematic feel.
+    """
+    # Build raw pixel rows (RGBA) with vertical gradient
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # filter: None
+        t = y / max(height - 1, 1)  # 0 at top, 1 at bottom
+        darken = 1.0 - 0.5 * t      # darken toward bottom
+        pr = max(0, min(255, int(r * darken)))
+        pg = max(0, min(255, int(g * darken)))
+        pb = max(0, min(255, int(b * darken)))
+        for _x in range(width):
+            raw.extend((pr, pg, pb, 255))
+
+    # Draw a simple text-like centered rectangle block as a label indicator
+    # (We can't render real text without PIL, but we can draw geometric shapes)
+    # Draw a semi-transparent dark bar across the center for the "label area"
+    bar_h = height // 5
+    bar_y_start = (height - bar_h) // 2
+    for y in range(bar_y_start, bar_y_start + bar_h):
+        row_offset = y * (1 + width * 4) + 1  # +1 for filter byte
+        for x in range(width):
+            px = row_offset + x * 4
+            # Blend with semi-transparent black
+            raw[px]     = raw[px]     // 2
+            raw[px + 1] = raw[px + 1] // 2
+            raw[px + 2] = raw[px + 2] // 2
+
+    # Draw a small white rectangle as a "play" icon in the center
+    icon_w, icon_h = min(20, width // 8), min(24, height // 8)
+    cx, cy = width // 2 - icon_w // 2, height // 2 - icon_h // 2
+    for y in range(cy, cy + icon_h):
+        if y < 0 or y >= height:
+            continue
+        row_offset = y * (1 + width * 4) + 1
+        for x in range(cx, cx + icon_w):
+            if x < 0 or x >= width:
+                continue
+            # Triangle shape: only draw if x is within the triangle at this row
+            rel_y = (y - cy) / max(icon_h - 1, 1)
+            tri_width = int(icon_w * (0.5 - abs(rel_y - 0.5)) * 2)
+            rel_x = x - cx
+            if rel_x < (icon_w - tri_width) // 2 or rel_x >= (icon_w + tri_width) // 2:
+                continue
+            px = row_offset + x * 4
+            raw[px] = 255
+            raw[px + 1] = 255
+            raw[px + 2] = 255
+            raw[px + 3] = 200
+
+    # Encode as PNG
+    def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        c = chunk_type + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    idat = zlib.compress(bytes(raw), 6)
+
+    out = b"\x89PNG\r\n\x1a\n"
+    out += _png_chunk(b"IHDR", ihdr)
+    out += _png_chunk(b"IDAT", idat)
+    out += _png_chunk(b"IEND", b"")
+    return out
+
+
+@app.get("/api/placeholder/{scene_index}")
+def placeholder_image(scene_index: int, w: int = Query(640), h: int = Query(360)):
+    """Generate a placeholder scene thumbnail image."""
+    w = min(w, 1280)
+    h = min(h, 720)
+    color = _SCENE_COLORS[scene_index % len(_SCENE_COLORS)]
+    png_data = _make_png(w, h, *color, label=f"Scene {scene_index + 1}")
+    return Response(content=png_data, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
 
 @app.get("/data/{path:path}")
 def serve_data(path: str):
     raise HTTPException(404, "No thumbnail available in mock server")
+    """Serve captured screenshots and other session data from disk."""
+    file_path = pathlib.Path(__file__).parent / "data" / path
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(404, f"File not found: {path}")
+    # Determine media type
+    suffix = file_path.suffix.lower()
+    media_types = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+    media_type = media_types.get(suffix, "application/octet-stream")
+    return FileResponse(str(file_path), media_type=media_type,
+                        headers={"Cache-Control": "public, max-age=3600"})
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
