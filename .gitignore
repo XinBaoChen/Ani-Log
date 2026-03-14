@@ -49,6 +49,7 @@ Makefile
 
 # ── Session / data files ────────────────────────────────────────
 backend/data/sessions/
+backend/data/mock_state.json
 
 # ── Nested duplicate folder (inner Ani-Log copy) ────────────────
 Ani-Log/
