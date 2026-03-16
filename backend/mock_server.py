@@ -11,6 +11,7 @@ Usage:
 """
 
 import io
+import json
 import os
 import uuid
 import time
@@ -19,20 +20,24 @@ import zlib
 import threading
 import pathlib
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import mss
 import mss.tools
 from PIL import Image
+import cv2
+import numpy as np
 
 # ── In-memory state ────────────────────────────────────────────────────────────
 
 DATA_DIR = pathlib.Path(__file__).parent / "data" / "sessions"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = DATA_DIR.parent / "mock_state.json"
+MAX_SCENES_PER_SESSION = 2500
+MAX_CAPTURE_FRAMES = 18000  # safety cap for very long sessions
 
 _capture_state = {
     "session_id": None,
@@ -45,6 +50,10 @@ _capture_state = {
 
 _capture_thread: Optional[threading.Thread] = None
 _capture_stop_event = threading.Event()
+_capture_frame_characters: dict[int, list[str]] = {}
+_capture_unique_characters: set[str] = set()
+_face_cascade: Any = None
+_hog_detector: Any = None
 
 _sessions = [
     {
@@ -296,6 +305,176 @@ def _search_text(obj: dict, q: str) -> bool:
     ]
     return any(q in f.lower() for f in fields)
 
+
+def _save_state() -> None:
+    """Persist mock state so sessions survive server restarts."""
+    payload = {
+        "sessions": _sessions,
+        "characters": _characters,
+        "scenes": _scenes,
+        "story_arcs": _story_arcs,
+        "saved_at": _now(),
+    }
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True)
+    tmp.replace(STATE_FILE)
+
+
+def _load_state() -> None:
+    """Load persisted mock state, if available."""
+    global _sessions, _characters, _scenes, _story_arcs
+    if not STATE_FILE.exists():
+        return
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        _sessions = payload.get("sessions", _sessions)
+        _characters = payload.get("characters", _characters)
+        _scenes = payload.get("scenes", _scenes)
+        _story_arcs = payload.get("story_arcs", _story_arcs)
+    except Exception as e:
+        print(f"[state] failed to load {STATE_FILE}: {e}")
+
+
+def _get_face_cascade() -> Any:
+    """Lazy-load OpenCV Haar cascade used as a lightweight character detector."""
+    global _face_cascade
+    if _face_cascade is None:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        _face_cascade = cv2.CascadeClassifier(cascade_path)
+    return _face_cascade
+
+
+def _get_hog_detector() -> Any:
+    """Lazy-load OpenCV people detector as a fallback for anime scenes."""
+    global _hog_detector
+    if _hog_detector is None:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        _hog_detector = hog
+    return _hog_detector
+
+
+def _face_feature(crop_bgr: np.ndarray) -> list[float]:
+    """Compute a compact visual feature for character re-identification."""
+    small = cv2.resize(crop_bgr, (32, 32), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [12, 8], [0, 180, 0, 256]).flatten()
+    norm = np.linalg.norm(hist)
+    if norm > 0:
+        hist = hist / norm
+    return hist.astype(np.float32).tolist()
+
+
+def _feature_distance(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b):
+        return 999.0
+    av = np.array(a, dtype=np.float32)
+    bv = np.array(b, dtype=np.float32)
+    return float(np.linalg.norm(av - bv))
+
+
+def _match_or_create_character(session_id: str, frame_idx: int, crop_rgb: Image.Image) -> str:
+    """Match a detected face to an existing character or create a new one."""
+    crop_bgr = cv2.cvtColor(np.array(crop_rgb), cv2.COLOR_RGB2BGR)
+    feat = _face_feature(crop_bgr)
+
+    # Match only against characters discovered from captured sessions.
+    best_id: Optional[str] = None
+    best_dist = 999.0
+    for ch in _characters:
+        meta = ch.get("metadata") or {}
+        stored = meta.get("feature")
+        if not stored:
+            continue
+        d = _feature_distance(feat, stored)
+        if d < best_dist:
+            best_dist = d
+            best_id = ch.get("id")
+
+    if best_id is not None and best_dist <= 0.45:
+        for ch in _characters:
+            if ch.get("id") == best_id:
+                ch["appearance_count"] = int(ch.get("appearance_count", 0)) + 1
+                ch["metadata"] = ch.get("metadata") or {}
+                ch["metadata"]["last_seen_frame"] = frame_idx
+                ch["metadata"]["last_session_id"] = session_id
+                return best_id
+
+    # New discovered character.
+    char_id = f"char-{uuid.uuid4().hex[:8]}"
+    char_name = f"Detected Character {len(_characters) + 1}"
+    char_dir = DATA_DIR / session_id / "characters"
+    char_dir.mkdir(parents=True, exist_ok=True)
+    char_path = char_dir / f"{char_id}.jpg"
+    crop_rgb.save(str(char_path), "JPEG", quality=90)
+
+    _characters.append({
+        "id": char_id,
+        "name": char_name,
+        "description": "Auto-detected from capture (face-based matcher).",
+        "appearance_count": 1,
+        "first_seen_at": _now(),
+        "thumbnail_url": f"/data/sessions/{session_id}/characters/{char_id}.jpg",
+        "metadata": {
+            "source": "opencv_haar_face",
+            "session_id": session_id,
+            "first_seen_frame": frame_idx,
+            "feature": feat,
+        },
+    })
+    return char_id
+
+
+def _detect_characters(session_id: str, frame_idx: int, pil_img: Image.Image) -> list[str]:
+    """Detect likely anime characters (faces) and track them across frames."""
+    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    cascade = _get_face_cascade()
+
+    faces = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.08,
+        minNeighbors=4,
+        minSize=(36, 36),
+    )
+
+    ids: list[str] = []
+    boxes: list[tuple[int, int, int, int]] = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in faces]
+
+    # Fallback: if no faces are detected, try a person detector.
+    if len(boxes) == 0:
+        hog = _get_hog_detector()
+        rects, _weights = hog.detectMultiScale(
+            bgr,
+            winStride=(8, 8),
+            padding=(8, 8),
+            scale=1.05,
+        )
+        boxes = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in rects[:4]]
+
+    for (x, y, w, h) in boxes:
+        x1, y1 = max(0, int(x)), max(0, int(y))
+        x2, y2 = min(pil_img.width, int(x + w)), min(pil_img.height, int(y + h))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = pil_img.crop((x1, y1, x2, y2))
+        ids.append(_match_or_create_character(session_id, frame_idx, crop))
+
+    # Deduplicate while preserving order.
+    uniq_ids = list(dict.fromkeys(ids))
+    return uniq_ids
+
+
+def _get_character_refs(char_ids: list[str]) -> list[dict]:
+    refs: list[dict] = []
+    for cid in char_ids:
+        ch = next((c for c in _characters if c.get("id") == cid), None)
+        if ch:
+            refs.append(ch)
+    return refs
+
 # ── Routes — Capture ──────────────────────────────────────────────────────────
 
 @app.get("/api/capture/status")
@@ -303,11 +482,6 @@ def get_capture_status():
     elapsed = 0
     if _capture_state["started_at"]:
         elapsed = int(time.time() - _capture_state["started_at"])
-        if _capture_state["status"] == "capturing":
-            _capture_state["total_frames"] = elapsed * _capture_state.get("fps", 2)
-            # Detect first scene immediately, then one every ~10 seconds
-            _capture_state["scenes_detected"] = max(1, elapsed // 10)
-            _capture_state["characters_found"] = min(8, max(1, elapsed // 8))
 
     return {
         "session_id": _capture_state["session_id"] or "",
@@ -325,12 +499,19 @@ def _capture_loop(session_id: str, fps: int, stop_event: threading.Event):
 
     interval = 1.0 / max(fps, 1)
     frame_idx = 0
+    _capture_frame_characters.clear()
+    _capture_unique_characters.clear()
 
     with mss.mss() as sct:
         monitor = sct.monitors[1]  # primary monitor
         while not stop_event.is_set():
             t0 = time.monotonic()
             try:
+                if frame_idx >= MAX_CAPTURE_FRAMES:
+                    print(f"[capture] reached MAX_CAPTURE_FRAMES={MAX_CAPTURE_FRAMES}, stopping")
+                    stop_event.set()
+                    break
+
                 raw = sct.grab(monitor)
                 img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
                 # Resize to reasonable web size (max 1280 wide)
@@ -339,9 +520,21 @@ def _capture_loop(session_id: str, fps: int, stop_event: threading.Event):
                     img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
                 path = session_dir / f"scene_{frame_idx:04d}.jpg"
                 img.save(str(path), "JPEG", quality=85)
+
+                # Lightweight character detection/tracking.
+                try:
+                    char_ids = _detect_characters(session_id, frame_idx, img)
+                except Exception as det_err:
+                    print(f"[detect] frame {frame_idx} error: {det_err}")
+                    char_ids = []
+                _capture_frame_characters[frame_idx] = char_ids
+                for cid in char_ids:
+                    _capture_unique_characters.add(cid)
+
                 frame_idx += 1
                 _capture_state["total_frames"] = frame_idx
                 _capture_state["scenes_detected"] = frame_idx
+                _capture_state["characters_found"] = len(_capture_unique_characters)
             except Exception as e:
                 print(f"[capture] frame {frame_idx} error: {e}")
 
@@ -370,6 +563,7 @@ def start_capture(req: CaptureStartRequest):
         "first_thumbnail_url": None,
     }
     _sessions.insert(0, new_session)
+    _save_state()
 
     _capture_state.update({
         "session_id": session_id,
@@ -432,6 +626,7 @@ def stop_capture():
         "session_id": None,
         "started_at": None,
     })
+    _save_state()
 
     return {"status": "stopped", "message": f"Capture stopped — {total_frames} frames saved"}
 
@@ -449,10 +644,16 @@ def _generate_real_scenes(session_id: str, total_frames: int, fps: int):
 
     interval = 1.0 / max(fps, 1)  # seconds between frames
 
-    for i, fpath in enumerate(files):
+    # Protect memory/API payload size for long recordings by downsampling scene rows.
+    stride = max(1, int(np.ceil(len(files) / MAX_SCENES_PER_SESSION)))
+    sampled = files[::stride]
+
+    for i, fpath in enumerate(sampled):
+        original_idx = i * stride
         scene_id = str(uuid.uuid4())
-        start_time = i * interval
-        end_time = (i + 1) * interval
+        start_time = original_idx * interval
+        end_time = min((original_idx + stride) * interval, len(files) * interval)
+        frame_char_ids = _capture_frame_characters.get(original_idx, [])
         _scenes.append({
             "id": scene_id,
             "session_id": session_id,
@@ -460,9 +661,9 @@ def _generate_real_scenes(session_id: str, total_frames: int, fps: int):
             "start_time": start_time,
             "end_time": end_time,
             "thumbnail_url": f"/data/sessions/{session_id}/scenes/{fpath.name}",
-            "description": f"Screen capture frame {i + 1}",
+            "description": f"Screen capture frame {original_idx + 1}",
             "location": "Desktop",
-            "characters": [],
+            "characters": _get_character_refs(frame_char_ids),
             "items": [],
         })
 
@@ -544,11 +745,26 @@ def get_session_scenes(session_id: str):
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
-    global _sessions
+    global _sessions, _scenes
     before = len(_sessions)
     _sessions = [s for s in _sessions if s["id"] != session_id]
     if len(_sessions) == before:
         raise HTTPException(404, "Session not found")
+
+    # Remove scenes from this session.
+    _scenes = [sc for sc in _scenes if sc.get("session_id") != session_id]
+
+    # Remove files on disk for this session.
+    session_dir = DATA_DIR / session_id
+    if session_dir.exists():
+        for p in sorted(session_dir.rglob("*"), reverse=True):
+            if p.is_file():
+                p.unlink(missing_ok=True)
+            else:
+                p.rmdir()
+        session_dir.rmdir()
+
+    _save_state()
     return {"status": "deleted"}
 
 # ── Routes — Search ───────────────────────────────────────────────────────────
@@ -631,6 +847,7 @@ def generate_summary(req: SummaryGenerateRequest):
         "generated_at": _now(),
     }
     _story_arcs.append(new_arc)
+    _save_state()
     return new_arc
 
 # ── Placeholder image generator ───────────────────────────────────────────────
@@ -742,6 +959,10 @@ def serve_data(path: str):
     media_type = media_types.get(suffix, "application/octet-stream")
     return FileResponse(str(file_path), media_type=media_type,
                         headers={"Cache-Control": "public, max-age=3600"})
+
+
+# Load persisted state on startup.
+_load_state()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
