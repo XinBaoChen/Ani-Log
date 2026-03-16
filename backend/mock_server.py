@@ -281,6 +281,8 @@ class CaptureStartRequest(BaseModel):
     title: str = "My Session"
     fps: int = 2
     source: str = "screen"
+    performance_mode: bool = False
+    adaptive_keyframes: bool = False
 
 class CharacterUpdateRequest(BaseModel):
     name: Optional[str] = None
@@ -375,7 +377,46 @@ def _feature_distance(a: list[float], b: list[float]) -> float:
     return float(np.linalg.norm(av - bv))
 
 
-def _match_or_create_character(session_id: str, frame_idx: int, crop_rgb: Image.Image) -> str:
+def _clamp01(v: float) -> float:
+    return max(0.0, min(1.0, v))
+
+
+def _face_confidence(img_w: int, img_h: int, box_w: int, box_h: int) -> float:
+    area = float(max(1, box_w * box_h)) / float(max(1, img_w * img_h))
+    # Heuristic confidence: larger stable face boxes are usually stronger detections.
+    return _clamp01(0.55 + min(area * 14.0, 0.40))
+
+
+def _hog_confidence(weight: float) -> float:
+    # Map HOG SVM margin to 0..1 with a soft clamp.
+    conf = 0.5 + (1.0 / (1.0 + float(np.exp(-weight))) - 0.5)
+    return _clamp01(conf)
+
+
+def _character_confidence(ch: dict) -> float:
+    raw = ch.get("confidence")
+    if isinstance(raw, (int, float)):
+        return _clamp01(float(raw))
+    meta = ch.get("metadata") or {}
+    meta_conf = meta.get("confidence")
+    if isinstance(meta_conf, (int, float)):
+        return _clamp01(float(meta_conf))
+    return 0.75
+
+
+def _with_character_confidence(ch: dict) -> dict:
+    out = dict(ch)
+    out["confidence"] = _character_confidence(ch)
+    return out
+
+
+def _match_or_create_character(
+    session_id: str,
+    frame_idx: int,
+    crop_rgb: Image.Image,
+    detection_confidence: float,
+    detector_source: str,
+) -> str:
     """Match a detected face to an existing character or create a new one."""
     crop_bgr = cv2.cvtColor(np.array(crop_rgb), cv2.COLOR_RGB2BGR)
     feat = _face_feature(crop_bgr)
@@ -396,10 +437,15 @@ def _match_or_create_character(session_id: str, frame_idx: int, crop_rgb: Image.
     if best_id is not None and best_dist <= 0.45:
         for ch in _characters:
             if ch.get("id") == best_id:
-                ch["appearance_count"] = int(ch.get("appearance_count", 0)) + 1
+                prev_count = int(ch.get("appearance_count", 0))
+                prev_conf = _character_confidence(ch)
+                ch["appearance_count"] = prev_count + 1
+                ch["confidence"] = ((prev_conf * prev_count) + detection_confidence) / max(1, prev_count + 1)
                 ch["metadata"] = ch.get("metadata") or {}
                 ch["metadata"]["last_seen_frame"] = frame_idx
                 ch["metadata"]["last_session_id"] = session_id
+                ch["metadata"]["source"] = detector_source
+                ch["metadata"]["confidence"] = ch["confidence"]
                 return best_id
 
     # New discovered character.
@@ -415,12 +461,14 @@ def _match_or_create_character(session_id: str, frame_idx: int, crop_rgb: Image.
         "name": char_name,
         "description": "Auto-detected from capture (face-based matcher).",
         "appearance_count": 1,
+        "confidence": detection_confidence,
         "first_seen_at": _now(),
         "thumbnail_url": f"/data/sessions/{session_id}/characters/{char_id}.jpg",
         "metadata": {
-            "source": "opencv_haar_face",
+            "source": detector_source,
             "session_id": session_id,
             "first_seen_frame": frame_idx,
+            "confidence": detection_confidence,
             "feature": feat,
         },
     })
@@ -441,26 +489,32 @@ def _detect_characters(session_id: str, frame_idx: int, pil_img: Image.Image) ->
     )
 
     ids: list[str] = []
-    boxes: list[tuple[int, int, int, int]] = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in faces]
+    detections: list[tuple[int, int, int, int, float, str]] = [
+        (int(x), int(y), int(w), int(h), _face_confidence(pil_img.width, pil_img.height, int(w), int(h)), "opencv_haar_face")
+        for (x, y, w, h) in faces
+    ]
 
     # Fallback: if no faces are detected, try a person detector.
-    if len(boxes) == 0:
+    if len(detections) == 0:
         hog = _get_hog_detector()
-        rects, _weights = hog.detectMultiScale(
+        rects, weights = hog.detectMultiScale(
             bgr,
             winStride=(8, 8),
             padding=(8, 8),
             scale=1.05,
         )
-        boxes = [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in rects[:4]]
+        detections = [
+            (int(x), int(y), int(w), int(h), _hog_confidence(float(wt)), "opencv_hog_person")
+            for (x, y, w, h), wt in list(zip(rects, weights))[:4]
+        ]
 
-    for (x, y, w, h) in boxes:
+    for (x, y, w, h, conf, source) in detections:
         x1, y1 = max(0, int(x)), max(0, int(y))
         x2, y2 = min(pil_img.width, int(x + w)), min(pil_img.height, int(y + h))
         if x2 <= x1 or y2 <= y1:
             continue
         crop = pil_img.crop((x1, y1, x2, y2))
-        ids.append(_match_or_create_character(session_id, frame_idx, crop))
+        ids.append(_match_or_create_character(session_id, frame_idx, crop, conf, source))
 
     # Deduplicate while preserving order.
     uniq_ids = list(dict.fromkeys(ids))
@@ -472,7 +526,7 @@ def _get_character_refs(char_ids: list[str]) -> list[dict]:
     for cid in char_ids:
         ch = next((c for c in _characters if c.get("id") == cid), None)
         if ch:
-            refs.append(ch)
+            refs.append(_with_character_confidence(ch))
     return refs
 
 # ── Routes — Capture ──────────────────────────────────────────────────────────
@@ -492,13 +546,22 @@ def get_capture_status():
         "elapsed_seconds": elapsed,
     }
 
-def _capture_loop(session_id: str, fps: int, stop_event: threading.Event):
+def _capture_loop(
+    session_id: str,
+    fps: int,
+    stop_event: threading.Event,
+    adaptive_keyframes: bool,
+    keyframe_threshold: float = 14.0,
+    max_keyframe_gap_sec: float = 4.0,
+):
     """Background thread: captures the screen using mss at the given FPS."""
     session_dir = DATA_DIR / session_id / "scenes"
     session_dir.mkdir(parents=True, exist_ok=True)
 
     interval = 1.0 / max(fps, 1)
     frame_idx = 0
+    last_saved_gray: Optional[np.ndarray] = None
+    last_saved_ts = 0.0
     _capture_frame_characters.clear()
     _capture_unique_characters.clear()
 
@@ -518,6 +581,28 @@ def _capture_loop(session_id: str, fps: int, stop_event: threading.Event):
                 if img.width > 1280:
                     ratio = 1280 / img.width
                     img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
+
+                keep_frame = True
+                if adaptive_keyframes:
+                    gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+                    small_gray = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+                    now_ts = time.monotonic()
+                    if last_saved_gray is not None:
+                        diff = cv2.absdiff(small_gray, last_saved_gray)
+                        diff_score = float(np.mean(diff))
+                        due_keepalive = (now_ts - last_saved_ts) >= max_keyframe_gap_sec
+                        keep_frame = diff_score >= keyframe_threshold or due_keepalive
+                    if keep_frame:
+                        last_saved_gray = small_gray
+                        last_saved_ts = now_ts
+
+                if not keep_frame:
+                    elapsed = time.monotonic() - t0
+                    sleep_time = interval - elapsed
+                    if sleep_time > 0:
+                        stop_event.wait(sleep_time)
+                    continue
+
                 path = session_dir / f"scene_{frame_idx:04d}.jpg"
                 img.save(str(path), "JPEG", quality=85)
 
@@ -565,6 +650,13 @@ def start_capture(req: CaptureStartRequest):
     _sessions.insert(0, new_session)
     _save_state()
 
+    effective_fps = req.fps
+    adaptive_keyframes = bool(req.adaptive_keyframes)
+    if req.performance_mode:
+        # Long-session preset: lower sample rate + adaptive keyframes.
+        effective_fps = min(effective_fps, 1)
+        adaptive_keyframes = True
+
     _capture_state.update({
         "session_id": session_id,
         "status": "capturing",
@@ -572,14 +664,16 @@ def start_capture(req: CaptureStartRequest):
         "characters_found": 0,
         "scenes_detected": 0,
         "started_at": time.time(),
-        "fps": req.fps,
+        "fps": effective_fps,
+        "performance_mode": req.performance_mode,
+        "adaptive_keyframes": adaptive_keyframes,
     })
 
     # Launch real screen capture in background thread
     _capture_stop_event.clear()
     _capture_thread = threading.Thread(
         target=_capture_loop,
-        args=(session_id, req.fps, _capture_stop_event),
+        args=(session_id, effective_fps, _capture_stop_event, adaptive_keyframes),
         daemon=True,
     )
     _capture_thread.start()
@@ -587,7 +681,7 @@ def start_capture(req: CaptureStartRequest):
     return {
         "session_id": session_id,
         "status": "capturing",
-        "message": f"Capture started at {req.fps} FPS",
+        "message": f"Capture started at {effective_fps} FPS (adaptive keyframes: {'on' if adaptive_keyframes else 'off'})",
     }
 
 @app.post("/api/capture/stop")
@@ -676,10 +770,13 @@ def list_characters(
     offset: int = Query(0),
 ):
     chars = list(_characters)
+    chars = [_with_character_confidence(c) for c in chars]
     if sort_by == "name":
         chars.sort(key=lambda c: c["name"])
     elif sort_by == "first_seen_at":
         chars.sort(key=lambda c: c["first_seen_at"], reverse=True)
+    elif sort_by == "confidence":
+        chars.sort(key=lambda c: c.get("confidence", 0), reverse=True)
     else:
         chars.sort(key=lambda c: c["appearance_count"], reverse=True)
     return chars[offset: offset + limit]
@@ -690,12 +787,12 @@ def get_character(character_id: str):
     if not char:
         raise HTTPException(404, "Character not found")
     return {
-        **char,
+        **_with_character_confidence(char),
         "appearances": [
             {"id": str(uuid.uuid4()), "scene_id": "scene-001", "timestamp": 65.0, "confidence": 0.94, "bbox": None},
             {"id": str(uuid.uuid4()), "scene_id": "scene-002", "timestamp": 205.0, "confidence": 0.91, "bbox": None},
         ],
-        "related_characters": [c for c in _characters if c["id"] != character_id][:3],
+        "related_characters": [_with_character_confidence(c) for c in _characters if c["id"] != character_id][:3],
     }
 
 @app.patch("/api/characters/{character_id}")
@@ -707,7 +804,7 @@ def update_character(character_id: str, req: CharacterUpdateRequest):
         char["name"] = req.name
     if req.description is not None:
         char["description"] = req.description
-    return char
+    return _with_character_confidence(char)
 
 # ── Routes — Scenes ───────────────────────────────────────────────────────────
 

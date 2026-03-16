@@ -223,6 +223,8 @@ Ani-Log/
 ### What Is Working Now
 - ✅ Real-time screen capture via `mss`
 - ✅ Lightweight character detection — OpenCV Haar cascade + HOG + HSV histogram re-ID
+- ✅ Performance Mode preset for long sessions — 1 FPS sampling + adaptive keyframes (change-based + keepalive)
+- ✅ Character confidence surfaced in UI with confidence sort and minimum-confidence filter
 - ✅ Session persistence across server restarts (`mock_state.json`)
 - ✅ Long-session safety caps — 18,000 frame hard cap, 2,500 scene stride downsampling
 - ✅ Scene viewer with autoplay, crossfade animation, and fullscreen toggle
@@ -238,6 +240,13 @@ Ani-Log/
 - [ ] Episode/series metadata — sessions need a title, episode number, and source field in the schema and UI
 - [ ] Scene detail modal — clicking a scene card should expand to full frame + character list + timestamp
 - [ ] End-to-end Docker Compose smoke test — confirm all services start cleanly together
+
+### Immediate Next Steps (Execution Order)
+1. Connect capture controls to `main.py` backend settings (thresholds and class filters) so Performance Mode works in real ML mode, not only mock mode.
+2. Persist per-session capture config (`fps`, `adaptive_keyframes`, `performance_mode`) into session metadata and show it on the Session detail page.
+3. Add confidence filtering directly to Scene and Session detail views, not only the Characters page.
+4. Add automated regression checks: long-session stress run (>= 30 min), memory profile snapshot, and API payload size checks.
+5. Define acceptance gates before release: max API response size, min FPS during capture, and target false-positive rate for low-confidence detections.
 
 ---
 

@@ -23,6 +23,7 @@ export interface Character {
   name: string;
   description: string | null;
   appearance_count: number;
+  confidence?: number;
   first_seen_at: string;
   thumbnail_url: string | null;
   metadata?: Record<string, unknown>;
@@ -70,6 +71,8 @@ export interface CaptureStartRequest {
   title: string;
   fps: number;
   source: string;
+  performance_mode?: boolean;
+  adaptive_keyframes?: boolean;
 }
 
 export interface CaptureStartResponse {
