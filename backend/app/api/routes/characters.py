@@ -14,15 +14,45 @@ from app.models.schemas import (
 )
 from app.services.vector_store import get_vector_store
 from app.services.feature_extractor import get_feature_extractor
+from app.api.routes.scenes import _thumb_url
 
 router = APIRouter()
+
+
+async def _character_confidence(db: AsyncSession, character: Character) -> float | None:
+    meta = character.metadata_ or {}
+    meta_conf = meta.get("confidence") if isinstance(meta, dict) else None
+    if isinstance(meta_conf, (int, float)):
+        return float(meta_conf)
+
+    result = await db.execute(
+        select(func.avg(CharacterAppearance.confidence)).where(CharacterAppearance.character_id == character.id)
+    )
+    avg_conf = result.scalar_one_or_none()
+    return float(avg_conf) if avg_conf is not None else None
+
+
+async def _character_thumbnail_url(db: AsyncSession, character: Character) -> str | None:
+    thumb = _thumb_url(character.thumbnail_path)
+    if thumb:
+        return thumb
+
+    result = await db.execute(
+        select(Scene.thumbnail_path)
+        .join(CharacterAppearance, CharacterAppearance.scene_id == Scene.id)
+        .where(CharacterAppearance.character_id == character.id)
+        .order_by(CharacterAppearance.timestamp.asc())
+        .limit(1)
+    )
+    scene_thumb = result.scalar_one_or_none()
+    return _thumb_url(scene_thumb)
 
 
 @router.get("/", response_model=list[CharacterResponse])
 async def list_characters(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    sort_by: str = Query("appearance_count", description="appearance_count | first_seen_at | name"),
+    sort_by: str = Query("appearance_count", description="appearance_count | first_seen_at | name | confidence"),
     db: AsyncSession = Depends(get_db),
 ):
     """List all detected characters."""
@@ -36,18 +66,23 @@ async def list_characters(
     result = await db.execute(query)
     characters = result.scalars().all()
 
-    return [
-        CharacterResponse(
+    rows: list[CharacterResponse] = []
+    for c in characters:
+        rows.append(CharacterResponse(
             id=c.id,
             name=c.name,
             description=c.description,
             appearance_count=c.appearance_count,
+            confidence=await _character_confidence(db, c),
             first_seen_at=c.first_seen_at,
-            thumbnail_url=f"/data/thumbnails/{c.id}.jpg" if c.thumbnail_path else None,
+            thumbnail_url=await _character_thumbnail_url(db, c),
             metadata=c.metadata_,
-        )
-        for c in characters
-    ]
+        ))
+
+    if sort_by == "confidence":
+        rows.sort(key=lambda x: x.confidence if isinstance(x.confidence, float) else -1.0, reverse=True)
+
+    return rows
 
 
 @router.get("/{character_id}", response_model=CharacterDetailResponse)
@@ -94,8 +129,9 @@ async def get_character(
         name=character.name,
         description=character.description,
         appearance_count=character.appearance_count,
+        confidence=await _character_confidence(db, character),
         first_seen_at=character.first_seen_at,
-        thumbnail_url=f"/data/thumbnails/{character.id}.jpg" if character.thumbnail_path else None,
+        thumbnail_url=await _character_thumbnail_url(db, character),
         metadata=character.metadata_,
         appearances=[
             AppearanceResponse(
@@ -113,8 +149,9 @@ async def get_character(
                 name=r.name,
                 description=r.description,
                 appearance_count=r.appearance_count,
+                confidence=await _character_confidence(db, r),
                 first_seen_at=r.first_seen_at,
-                thumbnail_url=f"/data/thumbnails/{r.id}.jpg" if r.thumbnail_path else None,
+                thumbnail_url=await _character_thumbnail_url(db, r),
             )
             for r in related
         ],
@@ -149,8 +186,9 @@ async def update_character(
         name=character.name,
         description=character.description,
         appearance_count=character.appearance_count,
+        confidence=await _character_confidence(db, character),
         first_seen_at=character.first_seen_at,
-        thumbnail_url=f"/data/thumbnails/{character.id}.jpg" if character.thumbnail_path else None,
+        thumbnail_url=await _character_thumbnail_url(db, character),
         metadata=character.metadata_,
     )
 
@@ -197,8 +235,9 @@ async def find_similar_characters(
             name=c.name,
             description=c.description,
             appearance_count=c.appearance_count,
+            confidence=await _character_confidence(db, c),
             first_seen_at=c.first_seen_at,
-            thumbnail_url=f"/data/thumbnails/{c.id}.jpg" if c.thumbnail_path else None,
+            thumbnail_url=await _character_thumbnail_url(db, c),
         )
         for c in similar_chars
     ]

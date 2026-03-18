@@ -126,6 +126,7 @@ def _scene_to_response(scene: Scene) -> SceneResponse:
                     name=char.name,
                     description=char.description,
                     appearance_count=char.appearance_count,
+                    confidence=appearance.confidence,
                     first_seen_at=char.first_seen_at,
                     thumbnail_url=_thumb_url(char.thumbnail_path),
                 )

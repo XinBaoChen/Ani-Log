@@ -1,5 +1,6 @@
 """Sessions routes — list and inspect capture sessions."""
 
+import json
 import shutil
 from pathlib import Path
 
@@ -17,6 +18,20 @@ from app.api.routes.scenes import _thumb_url
 router = APIRouter()
 
 
+def _load_capture_config(session_id: str) -> dict:
+    cfg_path = Path(settings.data_dir) / "sessions" / session_id / "capture_config.json"
+    if not cfg_path.exists():
+        return {}
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        return {}
+    return {}
+
+
 @router.get("/", response_model=list[SessionResponse])
 async def list_sessions(db: AsyncSession = Depends(get_db)):
     """List all capture sessions, newest first."""
@@ -29,6 +44,7 @@ async def list_sessions(db: AsyncSession = Depends(get_db)):
     # Attach scene counts and first thumbnail in a follow-up query per session
     out: list[SessionResponse] = []
     for s in sessions:
+        capture_cfg = _load_capture_config(s.id)
         scene_result = await db.execute(
             select(Scene)
             .where(Scene.session_id == s.id)
@@ -51,6 +67,9 @@ async def list_sessions(db: AsyncSession = Depends(get_db)):
             status=s.status,
             scene_count=len(scenes),
             first_thumbnail_url=first_thumb,
+            capture_fps=capture_cfg.get("fps"),
+            performance_mode=capture_cfg.get("performance_mode"),
+            adaptive_keyframes=capture_cfg.get("adaptive_keyframes"),
         ))
 
     return out
@@ -76,6 +95,8 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
         None,
     )
 
+    capture_cfg = _load_capture_config(s.id)
+
     return SessionResponse(
         id=s.id,
         title=s.title,
@@ -85,6 +106,9 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
         status=s.status,
         scene_count=len(scenes),
         first_thumbnail_url=first_thumb,
+        capture_fps=capture_cfg.get("fps"),
+        performance_mode=capture_cfg.get("performance_mode"),
+        adaptive_keyframes=capture_cfg.get("adaptive_keyframes"),
     )
 
 

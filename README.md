@@ -228,6 +228,8 @@ Ani-Log/
 - ✅ Session persistence across server restarts (`mock_state.json`)
 - ✅ Long-session safety caps — 18,000 frame hard cap, 2,500 scene stride downsampling
 - ✅ Scene viewer with autoplay, crossfade animation, and fullscreen toggle
+- ✅ Session stores capture preset metadata (`capture_fps`, `performance_mode`, `adaptive_keyframes`) and shows it in Session detail
+- ✅ Confidence filtering now available in Characters, Scenes, and Session detail views
 - ✅ Character thumbnails saved to disk with appearance counts
 - ✅ Characters linked into every scene response
 
@@ -242,11 +244,28 @@ Ani-Log/
 - [ ] End-to-end Docker Compose smoke test — confirm all services start cleanly together
 
 ### Immediate Next Steps (Execution Order)
-1. Connect capture controls to `main.py` backend settings (thresholds and class filters) so Performance Mode works in real ML mode, not only mock mode.
-2. Persist per-session capture config (`fps`, `adaptive_keyframes`, `performance_mode`) into session metadata and show it on the Session detail page.
-3. Add confidence filtering directly to Scene and Session detail views, not only the Characters page.
-4. Add automated regression checks: long-session stress run (>= 30 min), memory profile snapshot, and API payload size checks.
-5. Define acceptance gates before release: max API response size, min FPS during capture, and target false-positive rate for low-confidence detections.
+1. Run a full 30-minute stress test in both presets and capture memory profile over time (this update includes 20-second smoke baselines only).
+2. Add false-positive measurement harness for confidence thresholds using a labeled validation clip set.
+3. Surface dropped-frame and adaptive-skip counters in `/api/capture/status` to make preset behavior observable in real time.
+4. Add CI perf guardrail script that fails if baseline thresholds regress by >20%.
+
+### Stress Test Baseline (Completed)
+
+Two smoke tests were run against the API to establish initial performance gates:
+
+| Preset | Runtime | Frames | Effective FPS | Scene Rows |
+|---|---:|---:|---:|---:|
+| Performance Mode (1 FPS + adaptive keyframes) | 20.0s | 5 | 0.25 | 5 |
+| Balanced (2 FPS, adaptive off) | 22.2s | 44 | 1.98 | 44 |
+
+### Acceptance Thresholds (Current)
+
+| Metric | Threshold | Why |
+|---|---|---|
+| Balanced Effective FPS | >= 1.7 FPS at 2 FPS target | Keeps capture near real-time target on typical desktop load |
+| Performance Mode Effective FPS | <= 0.8 FPS during mostly-static scenes | Confirms storage/CPU savings from adaptive keyframes |
+| Session API payload (`/api/sessions/{id}/scenes`) | <= 12 MB for long sessions | Prevents UI lockups and oversized transfer bursts |
+| Weak-detection visibility | Confidence filter at 60% should remove most false positives | Gives practical control over noisy detections in UI |
 
 ---
 

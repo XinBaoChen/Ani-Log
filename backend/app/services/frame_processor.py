@@ -4,6 +4,7 @@ Provides a Python-based screen capture for when the C++ engine
 isn't available, and the main frame processing orchestration.
 """
 
+import json
 import time
 import asyncio
 import uuid
@@ -42,6 +43,12 @@ class FrameProcessor:
         self._capture: mss.mss | None = None
         self._data_dir = settings.data_dir.resolve()   # always absolute
         self._fps: int = settings.capture_fps
+        self._performance_mode: bool = False
+        self._adaptive_keyframes: bool = False
+        self._adaptive_threshold: float = 12.0
+        self._adaptive_keepalive_sec: float = 4.0
+        self._last_adaptive_frame_small: np.ndarray | None = None
+        self._last_adaptive_saved_ts: float = 0.0
         self._current_scene_id: str | None = None
         self._scene_start_time: float = 0.0
         self._last_keyframe_time: float = 0.0
@@ -58,6 +65,9 @@ class FrameProcessor:
             "running": self._running,
             "frame_count": self._frame_count,
             "elapsed_seconds": elapsed,
+            "fps": self._fps,
+            "performance_mode": self._performance_mode,
+            "adaptive_keyframes": self._adaptive_keyframes,
         }
 
     async def start_capture(
@@ -66,6 +76,8 @@ class FrameProcessor:
         source: str = "screen",
         fps: int | None = None,
         title: str = "Untitled Session",
+        performance_mode: bool = False,
+        adaptive_keyframes: bool = False,
     ):
         """Start the capture + processing loop.
 
@@ -83,7 +95,12 @@ class FrameProcessor:
         self._session_id = session_id
         self._frame_count = 0
         self._start_time = time.time()
-        self._fps = fps or settings.capture_fps
+        requested_fps = fps or settings.capture_fps
+        self._performance_mode = bool(performance_mode)
+        self._adaptive_keyframes = bool(adaptive_keyframes or performance_mode)
+        self._fps = min(requested_fps, 1) if self._performance_mode else requested_fps
+        self._last_adaptive_frame_small = None
+        self._last_adaptive_saved_ts = 0.0
         self._last_keyframe_time = 0.0
         self._current_scene_id = None
 
@@ -98,6 +115,19 @@ class FrameProcessor:
         session_dir.mkdir(parents=True, exist_ok=True)
         (session_dir / "scenes").mkdir(exist_ok=True)
         (session_dir / "characters").mkdir(exist_ok=True)
+
+        capture_config = {
+            "fps": self._fps,
+            "requested_fps": requested_fps,
+            "performance_mode": self._performance_mode,
+            "adaptive_keyframes": self._adaptive_keyframes,
+            "adaptive_threshold": self._adaptive_threshold,
+            "adaptive_keepalive_sec": self._adaptive_keepalive_sec,
+            "source": source,
+            "started_at": datetime.utcnow().isoformat() + "Z",
+        }
+        with (session_dir / "capture_config.json").open("w", encoding="utf-8") as f:
+            json.dump(capture_config, f, ensure_ascii=True, indent=2)
 
         # Persist CaptureSession to SQLite
         await self._create_db_session(session_id, title)
@@ -351,6 +381,15 @@ class FrameProcessor:
 
                 timestamp = time.time() - self._start_time
 
+                if not self._should_process_frame(frame, timestamp):
+                    elapsed = time.time() - start
+                    sleep_time = interval - elapsed
+                    if sleep_time > 0.001:
+                        await asyncio.sleep(sleep_time)
+                    else:
+                        await asyncio.sleep(0)
+                    continue
+
                 # Process frame — catch per-frame errors so the loop keeps running
                 try:
                     await self.process_frame(frame, timestamp)
@@ -397,6 +436,9 @@ class FrameProcessor:
                     logger.warning("ZMQ: failed to decode frame")
                     continue
 
+                if not self._should_process_frame(frame, ts):
+                    continue
+
                 analysis = await self.process_frame(frame, ts)
 
                 # Send result summary back to C++ engine
@@ -430,6 +472,33 @@ class FrameProcessor:
         union = area_a + area_b - intersection
 
         return intersection / (union + 1e-6)
+
+    def _should_process_frame(self, frame: np.ndarray, timestamp: float) -> bool:
+        """Adaptive keyframe gate for long sessions.
+
+        Keeps frames with meaningful visual changes plus periodic keepalives.
+        """
+        if not self._adaptive_keyframes:
+            return True
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+
+        if self._last_adaptive_frame_small is None:
+            self._last_adaptive_frame_small = small
+            self._last_adaptive_saved_ts = timestamp
+            return True
+
+        diff = cv2.absdiff(small, self._last_adaptive_frame_small)
+        diff_score = float(np.mean(diff))
+        keepalive_due = (timestamp - self._last_adaptive_saved_ts) >= self._adaptive_keepalive_sec
+
+        if diff_score >= self._adaptive_threshold or keepalive_due:
+            self._last_adaptive_frame_small = small
+            self._last_adaptive_saved_ts = timestamp
+            return True
+
+        return False
 
 
 # Singleton
