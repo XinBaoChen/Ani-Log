@@ -15,6 +15,8 @@ export default function CharacterDetailPage() {
   const [character, setCharacter] = useState<CharacterDetail | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const confidence = character?.confidence;
+
   useEffect(() => {
     const fetch = async () => {
       try {
@@ -98,6 +100,12 @@ export default function CharacterDetailPage() {
                   {character.appearance_count !== 1 ? "s" : ""}
                 </span>
               </div>
+              {typeof confidence === "number" && (
+                <div className="flex items-center gap-1.5 text-surface-400">
+                  <span className="inline-block w-2 h-2 rounded-full bg-primary-400" />
+                  <span>Confidence {(confidence * 100).toFixed(0)}%</span>
+                </div>
+              )}
               <div className="flex items-center gap-1.5 text-surface-400">
                 <Clock className="w-4 h-4" />
                 <span>

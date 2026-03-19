@@ -115,4 +115,7 @@ export interface Session {
   status: string;
   scene_count: number;
   first_thumbnail_url: string | null;
+  capture_fps?: number | null;
+  performance_mode?: boolean | null;
+  adaptive_keyframes?: boolean | null;
 }

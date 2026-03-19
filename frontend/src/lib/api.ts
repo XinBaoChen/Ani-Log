@@ -59,6 +59,9 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  deleteCharacter: (id: string) =>
+    request<void>(`/api/characters/${id}`, { method: "DELETE" }),
+
   // ─── Scenes ─────────────────────────────────────────────
   getScenes: (sessionId?: string) => {
     const query = sessionId ? `?session_id=${sessionId}` : "";
