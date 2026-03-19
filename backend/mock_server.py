@@ -359,14 +359,43 @@ def _get_hog_detector() -> Any:
 
 
 def _face_feature(crop_bgr: np.ndarray) -> list[float]:
-    """Compute a compact visual feature for character re-identification."""
-    small = cv2.resize(crop_bgr, (32, 32), interpolation=cv2.INTER_AREA)
-    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [12, 8], [0, 180, 0, 256]).flatten()
-    norm = np.linalg.norm(hist)
+    """Spatial-pyramid HSV + Sobel-edge descriptor for anime character re-ID.
+
+    Layout (272 dims, L2-normalised):
+      - Global H+S histogram 16×8  = 128 bins  (overall colour identity)
+      - 2×2 quadrant H+S histograms 8×4 × 4 = 128 bins  (spatial layout)
+      - Sobel edge-magnitude histogram 16 bins  (structural shape cue)
+    """
+    full = cv2.resize(crop_bgr, (64, 64), interpolation=cv2.INTER_AREA)
+    hsv  = cv2.cvtColor(full, cv2.COLOR_BGR2HSV)
+    feat: list[float] = []
+
+    # Global H+S histogram — 16×8 = 128 bins
+    h_global = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256]).flatten()
+    feat.extend(h_global.tolist())
+
+    # Spatial 2×2 grid — per-quadrant H+S 8×4 = 32 bins × 4 quadrants = 128 bins
+    half = 32
+    for oy in (0, half):
+        for ox in (0, half):
+            quad = hsv[oy:oy + half, ox:ox + half]
+            qh = cv2.calcHist([quad], [0, 1], None, [8, 4], [0, 180, 0, 256]).flatten()
+            feat.extend(qh.tolist())
+
+    # Sobel edge-magnitude histogram — 16 bins (shape / line-art cue)
+    gray = cv2.cvtColor(full, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    sx   = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sy   = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag  = np.sqrt(sx ** 2 + sy ** 2)
+    edge_hist = np.histogram(mag, bins=16, range=(0.0, 512.0))[0].astype(np.float32)
+    feat.extend(edge_hist.tolist())
+
+    # L2-normalise to unit vector so Euclidean distance ≈ angular similarity
+    arr = np.array(feat, dtype=np.float32)
+    norm = np.linalg.norm(arr)
     if norm > 0:
-        hist = hist / norm
-    return hist.astype(np.float32).tolist()
+        arr = arr / norm
+    return arr.tolist()
 
 
 def _feature_distance(a: list[float], b: list[float]) -> float:
@@ -393,7 +422,7 @@ def _hog_confidence(weight: float) -> float:
     return _clamp01(conf)
 
 
-def _character_confidence(ch: dict) -> float:
+def _character_confidence(ch: dict) -> Optional[float]:
     raw = ch.get("confidence")
     if isinstance(raw, (int, float)):
         return _clamp01(float(raw))
@@ -401,12 +430,69 @@ def _character_confidence(ch: dict) -> float:
     meta_conf = meta.get("confidence")
     if isinstance(meta_conf, (int, float)):
         return _clamp01(float(meta_conf))
-    return 0.75
+    # Static seeded demo characters may not have a model confidence.
+    return None
+
+
+def _fallback_character_thumbnail(char_id: str) -> str:
+    idx = abs(hash(char_id)) % 10
+    return f"/api/placeholder/{idx}?w=320&h=420"
+
+
+def _dedup_characters(session_id: str) -> int:
+    """Merge near-identical characters discovered in the same session.
+
+    Only touches characters whose ``metadata.session_id`` matches *session_id*
+    so named/seeded demo characters are never affected.
+    Returns the number of duplicates removed.
+    """
+    candidates = [
+        c for c in _characters
+        if (c.get("metadata") or {}).get("session_id") == session_id
+        and (c.get("metadata") or {}).get("feature")
+    ]
+    to_remove: set[str] = set()
+
+    for i in range(len(candidates)):
+        a = candidates[i]
+        if a["id"] in to_remove:
+            continue
+        feat_a = (a.get("metadata") or {}).get("feature", [])
+        for j in range(i + 1, len(candidates)):
+            b = candidates[j]
+            if b["id"] in to_remove:
+                continue
+            feat_b = (b.get("metadata") or {}).get("feature", [])
+            if _feature_distance(feat_a, feat_b) <= 0.40:
+                # Keep the one with more appearances; absorb count from the other
+                keep, drop = (
+                    (a, b) if a.get("appearance_count", 0) >= b.get("appearance_count", 0)
+                    else (b, a)
+                )
+                keep["appearance_count"] = (
+                    keep.get("appearance_count", 0) + drop.get("appearance_count", 0)
+                )
+                to_remove.add(drop["id"])
+
+    if to_remove:
+        _characters[:] = [c for c in _characters if c["id"] not in to_remove]
+        for sc in _scenes:
+            if sc.get("session_id") == session_id:
+                sc["characters"] = [
+                    ch for ch in sc.get("characters", [])
+                    if ch.get("id") not in to_remove
+                ]
+    return len(to_remove)
 
 
 def _with_character_confidence(ch: dict) -> dict:
     out = dict(ch)
-    out["confidence"] = _character_confidence(ch)
+    conf = _character_confidence(ch)
+    if conf is not None:
+        out["confidence"] = conf
+    thumb = out.get("thumbnail_url")
+    if not thumb:
+        out["thumbnail_url"] = _fallback_character_thumbnail(str(out.get("id", "char")))
     return out
 
 
@@ -434,18 +520,29 @@ def _match_or_create_character(
             best_dist = d
             best_id = ch.get("id")
 
-    if best_id is not None and best_dist <= 0.45:
+    if best_id is not None and best_dist <= 0.55:
         for ch in _characters:
             if ch.get("id") == best_id:
                 prev_count = int(ch.get("appearance_count", 0))
-                prev_conf = _character_confidence(ch)
+                prev_conf = _character_confidence(ch) or 0.0
                 ch["appearance_count"] = prev_count + 1
                 ch["confidence"] = ((prev_conf * prev_count) + detection_confidence) / max(1, prev_count + 1)
-                ch["metadata"] = ch.get("metadata") or {}
-                ch["metadata"]["last_seen_frame"] = frame_idx
-                ch["metadata"]["last_session_id"] = session_id
-                ch["metadata"]["source"] = detector_source
-                ch["metadata"]["confidence"] = ch["confidence"]
+                meta = ch.get("metadata") or {}
+                # Update feature template as exponential moving average (25% new sample)
+                # so the reference stays fresh across lighting/pose changes
+                stored_feat = meta.get("feature")
+                if stored_feat and len(stored_feat) == len(feat):
+                    alpha = 0.25
+                    updated = [(1 - alpha) * s + alpha * f for s, f in zip(stored_feat, feat)]
+                    norm = float(np.linalg.norm(updated))
+                    if norm > 0:
+                        updated = [v / norm for v in updated]
+                    meta["feature"] = updated
+                meta["last_seen_frame"] = frame_idx
+                meta["last_session_id"] = session_id
+                meta["source"] = detector_source
+                meta["confidence"] = ch["confidence"]
+                ch["metadata"] = meta
                 return best_id
 
     # New discovered character.
@@ -646,6 +743,9 @@ def start_capture(req: CaptureStartRequest):
         "total_frames": 0,
         "scene_count": 0,
         "first_thumbnail_url": None,
+        "capture_fps": None,
+        "performance_mode": None,
+        "adaptive_keyframes": None,
     }
     _sessions.insert(0, new_session)
     _save_state()
@@ -656,6 +756,10 @@ def start_capture(req: CaptureStartRequest):
         # Long-session preset: lower sample rate + adaptive keyframes.
         effective_fps = min(effective_fps, 1)
         adaptive_keyframes = True
+
+    new_session["capture_fps"] = effective_fps
+    new_session["performance_mode"] = req.performance_mode
+    new_session["adaptive_keyframes"] = adaptive_keyframes
 
     _capture_state.update({
         "session_id": session_id,
@@ -703,6 +807,11 @@ def stop_capture():
 
     # Build scene entries from actual captured screenshots
     _generate_real_scenes(sid, total_frames, fps)
+
+    # Merge characters that are too similar (same person, different crops)
+    n_merged = _dedup_characters(sid)
+    if n_merged:
+        print(f"[dedup] merged {n_merged} duplicate character(s) for session {sid[:8]}")
 
     for s in _sessions:
         if s["id"] == sid:
@@ -804,7 +913,24 @@ def update_character(character_id: str, req: CharacterUpdateRequest):
         char["name"] = req.name
     if req.description is not None:
         char["description"] = req.description
+    _save_state()
     return _with_character_confidence(char)
+
+@app.delete("/api/characters/{character_id}")
+def delete_character(character_id: str):
+    global _characters, _scenes
+    before = len(_characters)
+    _characters = [c for c in _characters if c["id"] != character_id]
+    if len(_characters) == before:
+        raise HTTPException(404, "Character not found")
+    # Remove from all scene character lists
+    for sc in _scenes:
+        sc["characters"] = [
+            ch for ch in sc.get("characters", [])
+            if ch.get("id") != character_id
+        ]
+    _save_state()
+    return {"status": "deleted"}
 
 # ── Routes — Scenes ───────────────────────────────────────────────────────────
 
@@ -1047,7 +1173,11 @@ def placeholder_image(scene_index: int, w: int = Query(640), h: int = Query(360)
 @app.get("/data/{path:path}")
 def serve_data(path: str):
     """Serve captured screenshots and other session data from disk."""
-    file_path = pathlib.Path(__file__).parent / "data" / path
+    base_dir = (pathlib.Path(__file__).parent / "data").resolve()
+    file_path = (base_dir / path).resolve()
+    # Guard against path traversal attacks
+    if not str(file_path).startswith(str(base_dir)):
+        raise HTTPException(403, "Access denied")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(404, f"File not found: {path}")
     # Determine media type

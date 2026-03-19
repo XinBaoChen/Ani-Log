@@ -15,6 +15,7 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
   const { status, setStatus, setStats, setSessionId } = useCaptureStore();
   const [title, setTitle] = useState("My Anime Session");
   const [fps, setFps] = useState(2);
+  const [preset, setPreset] = useState<"balanced" | "performance">("balanced");
   const [lastSessionId, setLastSessionId] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const router = useRouter();
@@ -48,7 +49,14 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
   const handleStart = async () => {
     try {
       setStatus("starting");
-      const response = await api.startCapture({ title, fps, source: "screen" });
+      const isPerformance = preset === "performance";
+      const response = await api.startCapture({
+        title,
+        fps: isPerformance ? 1 : fps,
+        source: "screen",
+        performance_mode: isPerformance,
+        adaptive_keyframes: isPerformance,
+      });
       setSessionId(response.session_id);
       setStatus("capturing");
       pollStatus();
@@ -166,6 +174,25 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
 
         <div>
           <label className="text-xs font-medium text-surface-400 mb-1.5 block">
+            Capture Preset
+          </label>
+          <select
+            value={preset}
+            onChange={(e) => setPreset(e.target.value as "balanced" | "performance")}
+            className="w-full px-3 py-3 bg-surface-900 border border-surface-700 rounded-xl
+                       text-sm text-surface-300 focus:outline-none focus:border-primary-500"
+            disabled={status === "capturing"}
+          >
+            <option value="balanced">Balanced — normal capture</option>
+            <option value="performance">Performance Mode — long sessions (1 FPS + adaptive keyframes)</option>
+          </select>
+          <p className="text-[11px] text-surface-600 mt-1">
+            Performance mode reduces storage and CPU by saving only meaningful frame changes plus periodic keepalive keyframes.
+          </p>
+        </div>
+
+        <div>
+          <label className="text-xs font-medium text-surface-400 mb-1.5 block">
             Sample FPS
           </label>
           <select
@@ -173,7 +200,7 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
             onChange={(e) => setFps(Number(e.target.value))}
             className="w-full px-3 py-3 bg-surface-900 border border-surface-700 rounded-xl
                        text-sm text-surface-300 focus:outline-none focus:border-primary-500"
-            disabled={status === "capturing"}
+            disabled={status === "capturing" || preset === "performance"}
           >
             <option value={1}>1 FPS — Low (saves storage)</option>
             <option value={2}>2 FPS — Default</option>
@@ -183,7 +210,9 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
             <option value={30}>30 FPS — Max (heavy CPU)</option>
           </select>
           <p className="text-[11px] text-surface-600 mt-1">
-            Higher FPS = more keyframes captured per second. Above 30 FPS is not achievable — Python screen capture peaks at ~30–50 FPS on Windows.
+            {preset === "performance"
+              ? "Locked by Performance Mode: 1 FPS sampling with adaptive keyframe saves for long sessions."
+              : "Higher FPS = more keyframes captured per second. Above 30 FPS is not achievable — Python screen capture peaks at ~30–50 FPS on Windows."}
           </p>
         </div>
       </div>
