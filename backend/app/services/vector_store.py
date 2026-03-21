@@ -67,6 +67,27 @@ class VectorStore:
             metadatas=[metadata or {}],
         )
 
+    def get_character_embedding(self, character_id: str) -> np.ndarray | None:
+        """Fetch a single character embedding by ID."""
+        try:
+            result = self.characters.get(ids=[character_id], include=["embeddings"])
+            emb = result.get("embeddings") if isinstance(result, dict) else None
+            if not emb:
+                return None
+            if not emb[0]:
+                return None
+            return np.asarray(emb[0], dtype=np.float32)
+        except Exception as exc:
+            logger.debug(f"Failed to fetch character embedding for {character_id}: {exc}")
+            return None
+
+    def delete_character(self, character_id: str):
+        """Remove a character embedding from vector store."""
+        try:
+            self.characters.delete(ids=[character_id])
+        except Exception as exc:
+            logger.debug(f"Failed to delete character embedding for {character_id}: {exc}")
+
     def find_similar_character(
         self,
         embedding: np.ndarray,

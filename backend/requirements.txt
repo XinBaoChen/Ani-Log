@@ -13,6 +13,8 @@ chromadb==0.4.22
 
 # Vision / ML
 ultralytics==8.1.0
+insightface==0.7.3
+onnxruntime==1.17.0
 torch==2.2.0
 torchvision==0.17.0
 open-clip-torch==2.24.0
@@ -21,6 +23,9 @@ opencv-python-headless==4.9.0.80
 numpy==1.26.3
 scipy==1.12.0
 scikit-learn==1.4.0
+
+# Optional anime-specific detector stack
+anime-face-detector==0.0.9
 
 # Tracking
 supervision==0.18.0
