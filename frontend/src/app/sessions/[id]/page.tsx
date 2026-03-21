@@ -68,6 +68,7 @@ export default function SessionDetailPage() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [autoplayDone, setAutoplayDone] = useState(false);
+  const [minConfidence, setMinConfidence] = useState(0.5);
   const viewerContainerRef = useRef<HTMLDivElement>(null);
 
   const scenesRef     = useRef<Scene[]>([]);
@@ -398,6 +399,13 @@ export default function SessionDetailPage() {
   const scene     = scenes[current] ?? null;
   const canPlay   = scenes.length >= 2;
   const allLoaded = preloaded >= scenes.length;
+  const stripScenes = scenes.filter((sc) => {
+    const vals = (sc.characters || [])
+      .map((c) => c.confidence)
+      .filter((v): v is number => typeof v === "number");
+    if (vals.length === 0) return true;
+    return Math.max(...vals) >= minConfidence;
+  });
 
   return (
     <div ref={viewerContainerRef} className="flex flex-col bg-black" style={{ height: isFullscreen ? "100vh" : "calc(100vh - 4rem)" }}>
@@ -428,6 +436,13 @@ export default function SessionDetailPage() {
           <span className="text-xs text-surface-500">
             {scenes.length} frame{scenes.length !== 1 ? "s" : ""}
           </span>
+          {session && (
+            <span className="text-xs text-surface-600">
+              {session.performance_mode ? "Performance mode" : "Balanced"}
+              {typeof session.capture_fps === "number" ? ` • ${session.capture_fps} FPS` : ""}
+              {session.adaptive_keyframes ? " • Adaptive keyframes" : ""}
+            </span>
+          )}
 
           {/* Delete button */}
           <button
@@ -586,9 +601,32 @@ export default function SessionDetailPage() {
               <span className="hidden lg:block text-xs text-surface-700 ml-2 select-none">← → Space F</span>
             </div>
 
+            <div className="flex items-center gap-2">
+              <label htmlFor="session-confidence-filter" className="text-xs text-surface-500 whitespace-nowrap">
+                Min char confidence
+              </label>
+              <input
+                id="session-confidence-filter"
+                type="range"
+                min={0.3}
+                max={0.95}
+                step={0.05}
+                value={minConfidence}
+                onChange={(e) => setMinConfidence(Number(e.target.value))}
+                className="w-32 accent-primary-500"
+              />
+              <span className="text-xs font-mono text-surface-400 w-10 text-right">
+                {(minConfidence * 100).toFixed(0)}%
+              </span>
+              <span className="text-xs text-surface-600">
+                Strip shows {stripScenes.length}/{scenes.length} frames above threshold
+              </span>
+            </div>
+
             {scenes.length > 1 && (
               <div ref={stripRef} className="flex gap-1.5 overflow-x-auto" style={{ scrollbarWidth: "thin" }}>
-                {scenes.map((sc, i) => {
+                {stripScenes.map((sc) => {
+                  const i = scenes.findIndex((x) => x.id === sc.id);
                   const src = thumb(sc.thumbnail_url);
                   return (
                     <button key={sc.id} onClick={() => go(i)}

@@ -8,6 +8,7 @@ import json
 import time
 import asyncio
 import uuid
+from collections import defaultdict
 import cv2
 import numpy as np
 import mss
@@ -52,6 +53,8 @@ class FrameProcessor:
         self._current_scene_id: str | None = None
         self._scene_start_time: float = 0.0
         self._last_keyframe_time: float = 0.0
+        self._auto_character_counter: int = 0
+        self._last_appearance_ts: dict[tuple[str, str], float] = {}
 
     @property
     def is_running(self) -> bool:
@@ -98,11 +101,13 @@ class FrameProcessor:
         requested_fps = fps or settings.capture_fps
         self._performance_mode = bool(performance_mode)
         self._adaptive_keyframes = bool(adaptive_keyframes or performance_mode)
-        self._fps = min(requested_fps, 1) if self._performance_mode else requested_fps
+        self._fps = max(requested_fps, 6) if self._performance_mode else requested_fps
         self._last_adaptive_frame_small = None
         self._last_adaptive_saved_ts = 0.0
         self._last_keyframe_time = 0.0
         self._current_scene_id = None
+        self._auto_character_counter = 0
+        self._last_appearance_ts = {}
 
         # Reset components
         get_tracker().reset()
@@ -179,6 +184,11 @@ class FrameProcessor:
                 row.total_frames = self._frame_count
                 await db.commit()
 
+        try:
+            await self._merge_session_character_duplicates(session_id)
+        except Exception as exc:
+            logger.warning(f"Duplicate merge post-processing skipped: {exc}")
+
     async def _persist_character(
         self, char_id: str, track: "Track", timestamp: float, session_dir: Path, frame: np.ndarray
     ):
@@ -195,7 +205,7 @@ class FrameProcessor:
         async with async_session() as db:
             character = Character(
                 id=char_id,
-                name="Unknown",
+                name=f"Detected Character {self._auto_character_counter + 1}",
                 chroma_id=char_id,
                 thumbnail_path=rel_thumb.as_posix(),
                 first_seen_at=datetime.utcnow(),
@@ -203,6 +213,7 @@ class FrameProcessor:
             )
             db.add(character)
             await db.commit()
+            self._auto_character_counter += 1
 
     async def _persist_scene(self, scene_index: int, timestamp: float, thumb_path: str):
         """Save a Scene row to SQLite."""
@@ -226,6 +237,11 @@ class FrameProcessor:
         self, character_id: str, scene_id: str, timestamp: float, confidence: float, bbox: list[float]
     ):
         """Record a CharacterAppearance linking character ↔ scene."""
+        key = (scene_id, character_id)
+        last_ts = self._last_appearance_ts.get(key)
+        if last_ts is not None and (timestamp - last_ts) < settings.appearance_smoothing_window_sec:
+            return
+
         async with async_session() as db:
             app = CharacterAppearance(
                 id=str(uuid.uuid4()),
@@ -237,6 +253,89 @@ class FrameProcessor:
             )
             db.add(app)
             await db.commit()
+        self._last_appearance_ts[key] = timestamp
+
+    async def _merge_session_character_duplicates(self, session_id: str):
+        """Cluster-by-embedding and merge near-duplicate characters in a session."""
+        async with async_session() as db:
+            from sqlalchemy import select
+
+            result = await db.execute(select(Character))
+            chars = [
+                c for c in result.scalars().all()
+                if isinstance(c.metadata_, dict) and c.metadata_.get("session_id") == session_id
+            ]
+
+            if len(chars) < 2:
+                return
+
+            vector_store = get_vector_store()
+            embeddings: dict[str, np.ndarray] = {}
+            for c in chars:
+                emb = vector_store.get_character_embedding(c.id)
+                if emb is not None:
+                    embeddings[c.id] = emb
+
+            if len(embeddings) < 2:
+                return
+
+            parent: dict[str, str] = {c.id: c.id for c in chars}
+
+            def find(x: str) -> str:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a: str, b: str):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+            ids = list(embeddings.keys())
+            for i in range(len(ids)):
+                a = ids[i]
+                va = embeddings[a]
+                for j in range(i + 1, len(ids)):
+                    b = ids[j]
+                    vb = embeddings[b]
+                    denom = (np.linalg.norm(va) * np.linalg.norm(vb)) + 1e-6
+                    sim = float(np.dot(va, vb) / denom)
+                    if sim >= settings.character_cluster_threshold:
+                        union(a, b)
+
+            groups: dict[str, list[Character]] = defaultdict(list)
+            for c in chars:
+                groups[find(c.id)].append(c)
+
+            merged = 0
+            for members in groups.values():
+                if len(members) < 2:
+                    continue
+
+                keep = sorted(
+                    members,
+                    key=lambda c: (1 if c.name == "Unknown" else 0, -int(c.appearance_count or 0)),
+                )[0]
+
+                for drop in members:
+                    if drop.id == keep.id:
+                        continue
+
+                    app_result = await db.execute(
+                        select(CharacterAppearance).where(CharacterAppearance.character_id == drop.id)
+                    )
+                    for app_row in app_result.scalars().all():
+                        app_row.character_id = keep.id
+
+                    keep.appearance_count = int(keep.appearance_count or 0) + int(drop.appearance_count or 0)
+                    await db.delete(drop)
+                    vector_store.delete_character(drop.id)
+                    merged += 1
+
+            if merged:
+                await db.commit()
+                logger.info(f"Merged {merged} duplicate characters in session {session_id}")
 
     async def process_frame(self, frame: np.ndarray, timestamp: float) -> FrameAnalysis:
         """
@@ -284,7 +383,7 @@ class FrameProcessor:
         session_dir = self._data_dir / "sessions" / (self._session_id or "unknown")
         for i, track in enumerate(tracks):
             if track.feature is not None and track.hits >= settings.tracker_min_hits:
-                matches = vector_store.find_similar_character(track.feature, top_k=1)
+                matches = vector_store.find_similar_character(track.feature, top_k=1, threshold=0.70)
                 if matches and matches[0]["score"] >= settings.reidentification_threshold:
                     track.character_id = matches[0]["id"]
                 elif track.character_id is None:

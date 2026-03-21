@@ -52,7 +52,7 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
       const isPerformance = preset === "performance";
       const response = await api.startCapture({
         title,
-        fps: isPerformance ? 1 : fps,
+        fps: isPerformance ? 6 : fps,
         source: "screen",
         performance_mode: isPerformance,
         adaptive_keyframes: isPerformance,
@@ -184,10 +184,10 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
             disabled={status === "capturing"}
           >
             <option value="balanced">Balanced — normal capture</option>
-            <option value="performance">Performance Mode — long sessions (1 FPS + adaptive keyframes)</option>
+            <option value="performance">Performance Mode — smoother long sessions (6 FPS + adaptive keyframes)</option>
           </select>
           <p className="text-[11px] text-surface-600 mt-1">
-            Performance mode reduces storage and CPU by saving only meaningful frame changes plus periodic keepalive keyframes.
+            Performance mode keeps scrolling smoother while reducing CPU by combining adaptive keyframes with lighter detection frequency.
           </p>
         </div>
 
@@ -211,7 +211,7 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
           </select>
           <p className="text-[11px] text-surface-600 mt-1">
             {preset === "performance"
-              ? "Locked by Performance Mode: 1 FPS sampling with adaptive keyframe saves for long sessions."
+              ? "Locked by Performance Mode: 6 FPS sampling, adaptive keyframes, and lighter detection stride for smoother capture."
               : "Higher FPS = more keyframes captured per second. Above 30 FPS is not achievable — Python screen capture peaks at ~30–50 FPS on Windows."}
           </p>
         </div>
