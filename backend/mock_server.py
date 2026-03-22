@@ -55,6 +55,8 @@ _capture_unique_characters: set[str] = set()
 _face_cascade: Any = None
 _hog_detector: Any = None
 
+AUTO_NAME_PREFIX = "Detected Character"
+
 _sessions = [
     {
         "id": "sess-001",
@@ -439,6 +441,11 @@ def _fallback_character_thumbnail(char_id: str) -> str:
     return f"/api/placeholder/{idx}?w=320&h=420"
 
 
+def _is_auto_named(ch: dict) -> bool:
+    name = str(ch.get("name", ""))
+    return name.startswith(AUTO_NAME_PREFIX)
+
+
 def _dedup_characters(session_id: str) -> int:
     """Merge near-identical characters discovered in the same session.
 
@@ -451,38 +458,94 @@ def _dedup_characters(session_id: str) -> int:
         if (c.get("metadata") or {}).get("session_id") == session_id
         and (c.get("metadata") or {}).get("feature")
     ]
-    to_remove: set[str] = set()
+    if len(candidates) < 2:
+        return 0
 
+    parent: dict[str, str] = {c["id"]: c["id"] for c in candidates}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Union similar characters (transitively) to avoid pairwise-only misses.
     for i in range(len(candidates)):
         a = candidates[i]
-        if a["id"] in to_remove:
-            continue
         feat_a = (a.get("metadata") or {}).get("feature", [])
         for j in range(i + 1, len(candidates)):
             b = candidates[j]
-            if b["id"] in to_remove:
-                continue
             feat_b = (b.get("metadata") or {}).get("feature", [])
-            if _feature_distance(feat_a, feat_b) <= 0.40:
-                # Keep the one with more appearances; absorb count from the other
-                keep, drop = (
-                    (a, b) if a.get("appearance_count", 0) >= b.get("appearance_count", 0)
-                    else (b, a)
-                )
-                keep["appearance_count"] = (
-                    keep.get("appearance_count", 0) + drop.get("appearance_count", 0)
-                )
-                to_remove.add(drop["id"])
+            if _feature_distance(feat_a, feat_b) <= 0.36:
+                union(a["id"], b["id"])
 
-    if to_remove:
-        _characters[:] = [c for c in _characters if c["id"] not in to_remove]
-        for sc in _scenes:
-            if sc.get("session_id") == session_id:
-                sc["characters"] = [
-                    ch for ch in sc.get("characters", [])
-                    if ch.get("id") not in to_remove
-                ]
+    groups: dict[str, list[dict]] = {}
+    for c in candidates:
+        groups.setdefault(find(c["id"]), []).append(c)
+
+    remap: dict[str, str] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # Prefer manually renamed identities over auto-generated names, then appearance count.
+        keep = sorted(
+            members,
+            key=lambda c: (
+                1 if _is_auto_named(c) else 0,
+                -int(c.get("appearance_count", 0)),
+            ),
+        )[0]
+        for m in members:
+            if m["id"] == keep["id"]:
+                continue
+            keep["appearance_count"] = int(keep.get("appearance_count", 0)) + int(m.get("appearance_count", 0))
+            remap[m["id"]] = keep["id"]
+
+    if not remap:
+        return 0
+
+    for sc in _scenes:
+        if sc.get("session_id") != session_id:
+            continue
+        new_chars: list[dict] = []
+        seen: set[str] = set()
+        for ch in sc.get("characters", []):
+            cid = str(ch.get("id"))
+            target_id = remap.get(cid, cid)
+            if target_id in seen:
+                continue
+            target = next((c for c in _characters if c.get("id") == target_id), ch)
+            new_chars.append(_with_character_confidence(target))
+            seen.add(target_id)
+        sc["characters"] = new_chars
+
+    for k, ids in list(_capture_frame_characters.items()):
+        replaced = [remap.get(cid, cid) for cid in ids]
+        _capture_frame_characters[k] = list(dict.fromkeys(replaced))
+
+    to_remove = set(remap.keys())
+    _characters[:] = [c for c in _characters if c["id"] not in to_remove]
     return len(to_remove)
+
+
+def _dedup_existing_characters() -> int:
+    """Consolidate duplicates from all discovered sessions."""
+    session_ids = {
+        str((c.get("metadata") or {}).get("session_id"))
+        for c in _characters
+        if (c.get("metadata") or {}).get("session_id")
+    }
+    merged = 0
+    for sid in session_ids:
+        merged += _dedup_characters(sid)
+    if merged:
+        _save_state()
+    return merged
 
 
 def _with_character_confidence(ch: dict) -> dict:
@@ -520,7 +583,7 @@ def _match_or_create_character(
             best_dist = d
             best_id = ch.get("id")
 
-    if best_id is not None and best_dist <= 0.55:
+    if best_id is not None and best_dist <= 0.50:
         for ch in _characters:
             if ch.get("id") == best_id:
                 prev_count = int(ch.get("appearance_count", 0))
@@ -547,7 +610,8 @@ def _match_or_create_character(
 
     # New discovered character.
     char_id = f"char-{uuid.uuid4().hex[:8]}"
-    char_name = f"Detected Character {len(_characters) + 1}"
+    detected_idx = sum(1 for c in _characters if _is_auto_named(c)) + 1
+    char_name = f"{AUTO_NAME_PREFIX} {detected_idx}"
     char_dir = DATA_DIR / session_id / "characters"
     char_dir.mkdir(parents=True, exist_ok=True)
     char_path = char_dir / f"{char_id}.jpg"
@@ -648,6 +712,7 @@ def _capture_loop(
     fps: int,
     stop_event: threading.Event,
     adaptive_keyframes: bool,
+    detection_stride: int,
     keyframe_threshold: float = 14.0,
     max_keyframe_gap_sec: float = 4.0,
 ):
@@ -703,12 +768,15 @@ def _capture_loop(
                 path = session_dir / f"scene_{frame_idx:04d}.jpg"
                 img.save(str(path), "JPEG", quality=85)
 
-                # Lightweight character detection/tracking.
-                try:
-                    char_ids = _detect_characters(session_id, frame_idx, img)
-                except Exception as det_err:
-                    print(f"[detect] frame {frame_idx} error: {det_err}")
-                    char_ids = []
+                # Run detector every N saved frames in performance mode to reduce CPU spikes.
+                if frame_idx % max(1, detection_stride) == 0:
+                    try:
+                        char_ids = _detect_characters(session_id, frame_idx, img)
+                    except Exception as det_err:
+                        print(f"[detect] frame {frame_idx} error: {det_err}")
+                        char_ids = []
+                else:
+                    char_ids = _capture_frame_characters.get(frame_idx - 1, [])
                 _capture_frame_characters[frame_idx] = char_ids
                 for cid in char_ids:
                     _capture_unique_characters.add(cid)
@@ -752,10 +820,12 @@ def start_capture(req: CaptureStartRequest):
 
     effective_fps = req.fps
     adaptive_keyframes = bool(req.adaptive_keyframes)
+    detection_stride = 1
     if req.performance_mode:
-        # Long-session preset: lower sample rate + adaptive keyframes.
-        effective_fps = min(effective_fps, 1)
+        # Keep output smoother while still lowering compute cost.
+        effective_fps = max(effective_fps, 6)
         adaptive_keyframes = True
+        detection_stride = 3
 
     new_session["capture_fps"] = effective_fps
     new_session["performance_mode"] = req.performance_mode
@@ -771,13 +841,14 @@ def start_capture(req: CaptureStartRequest):
         "fps": effective_fps,
         "performance_mode": req.performance_mode,
         "adaptive_keyframes": adaptive_keyframes,
+        "detection_stride": detection_stride,
     })
 
     # Launch real screen capture in background thread
     _capture_stop_event.clear()
     _capture_thread = threading.Thread(
         target=_capture_loop,
-        args=(session_id, effective_fps, _capture_stop_event, adaptive_keyframes),
+        args=(session_id, effective_fps, _capture_stop_event, adaptive_keyframes, detection_stride),
         daemon=True,
     )
     _capture_thread.start()
@@ -785,7 +856,7 @@ def start_capture(req: CaptureStartRequest):
     return {
         "session_id": session_id,
         "status": "capturing",
-        "message": f"Capture started at {effective_fps} FPS (adaptive keyframes: {'on' if adaptive_keyframes else 'off'})",
+        "message": f"Capture started at {effective_fps} FPS (adaptive keyframes: {'on' if adaptive_keyframes else 'off'}, detection stride: {detection_stride})",
     }
 
 @app.post("/api/capture/stop")
@@ -878,6 +949,7 @@ def list_characters(
     limit: int = Query(50),
     offset: int = Query(0),
 ):
+    _dedup_existing_characters()
     chars = list(_characters)
     chars = [_with_character_confidence(c) for c in chars]
     if sort_by == "name":

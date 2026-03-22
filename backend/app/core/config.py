@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     tracker_min_hits: int = 3
     tracker_iou_threshold: float = 0.3
     reidentification_threshold: float = 0.75
+    character_cluster_threshold: float = 0.82
+    appearance_smoothing_window_sec: float = 1.0
 
     # ─── Frame Sampling ─────────────────────────────────────
     capture_fps: int = 2
