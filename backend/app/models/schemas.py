@@ -10,6 +10,8 @@ class CaptureStartRequest(BaseModel):
     fps: int = Field(default=2, ge=1, le=30)
     source: str = Field(default="screen", description="screen | window | file")
     source_path: str | None = None  # for file mode
+    performance_mode: bool = False
+    adaptive_keyframes: bool = False
 
 
 class CaptureStartResponse(BaseModel):
@@ -37,6 +39,9 @@ class SessionResponse(BaseModel):
     status: str
     scene_count: int = 0
     first_thumbnail_url: str | None = None
+    capture_fps: int | None = None
+    performance_mode: bool | None = None
+    adaptive_keyframes: bool | None = None
 
     class Config:
         from_attributes = True
@@ -51,6 +56,7 @@ class CharacterBase(BaseModel):
 class CharacterResponse(CharacterBase):
     id: str
     appearance_count: int
+    confidence: float | None = None
     first_seen_at: datetime
     thumbnail_url: str | None = None
     metadata: dict | None = None

@@ -39,15 +39,24 @@ async def start_capture(request: CaptureStartRequest):
             source=source,
             fps=request.fps,
             title=request.title,
+            performance_mode=request.performance_mode,
+            adaptive_keyframes=request.adaptive_keyframes,
         )
     )
 
-    logger.info(f"Capture session started: {session_id} (source={source}, fps={request.fps})")
+    logger.info(
+        f"Capture session started: {session_id} "
+        f"(source={source}, fps={request.fps}, performance={request.performance_mode}, adaptive={request.adaptive_keyframes})"
+    )
 
     return CaptureStartResponse(
         session_id=session_id,
         status="capturing",
-        message=f"Capture started at {request.fps} FPS via {source}",
+        message=(
+            f"Capture started at {request.fps} FPS via {source} "
+            f"(performance={'on' if request.performance_mode else 'off'}, "
+            f"adaptive={'on' if request.adaptive_keyframes else 'off'})"
+        ),
     )
 
 
