@@ -1,64 +1,218 @@
-# ── Node / Next.js ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# Node / Next.js (Frontend)
+# ═════════════════════════════════════════════════════════════
 node_modules/
 .next/
+.vercel/
 out/
-dist/
 build/
+dist/
+public/static/
 .turbo/
 *.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+lerna-debug.log*
 
-# ── Environment files ───────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# Environment & Configuration
+# ═════════════════════════════════════════════════════════════
 .env
 .env.local
 .env.*.local
+.env.production.local
+.env.development.local
+.env.test.local
 # keep the example so others know what vars are needed
 !.env.example
+!.env.example.*
 
-# ── Python ──────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# Python (Backend)
+# ═════════════════════════════════════════════════════════════
 __pycache__/
 *.py[cod]
+*.py[cod]*
 *.pyo
-.venv/
-venv/
-env/
+*.pyd
+.Python
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
-dist/
+.installed.cfg
+*.egg
+MANIFEST
 .pytest_cache/
 .mypy_cache/
+.dmypy.json
+dmypy.json
 .ruff_cache/
+.venv/
+.venv311/
+.venv_wsl/
+.venv_wsl311/
+venv/
+venv*/
+ENV/
+env.bak/
+venv.bak/
+.pytype/
+.hypothesis/
+htmlcov/
+.coverage
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
 
-# ── C++ / CMake build output ────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# C++ / CMake (Capture Engine)
+# ═════════════════════════════════════════════════════════════
 capture_engine/build/
 capture_engine/cmake-build-*/
+capture_engine/.cmake/
+capture_engine/CMakeUserPresets.json
 *.o
 *.obj
-*.exe
-*.dll
-*.so
-*.dylib
 *.a
 *.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+*.make
+*.cmake
+compile_commands.json
+.clangd/
 
-# ── Session / data files ────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════
+# Session & Data Files
+# ═════════════════════════════════════════════════════════════
 backend/data/sessions/
 backend/data/mock_state.json
+backend/data/chroma*/
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.sqlite3
+backend/chroma.log
+backend/*.log
 
-# ── Nested duplicate folder (inner Ani-Log copy) ────────────────
-Ani-Log/
+# ═════════════════════════════════════════════════════════════
+# Virtual Environment Nested Paths
+# ═════════════════════════════════════════════════════════════
+.venv*/
+venv*/
+backend/.venv/
+backend/.venv311/
+backend/.venv_wsl/
+backend/.venv_wsl311/
 
-# ── OS & editor ─────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
-desktop.ini
+# ═════════════════════════════════════════════════════════════
+# IDE & Editor Configuration
+# ═════════════════════════════════════════════════════════════
 .vscode/
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
 .idea/
+.idea_modules/
+*.iml
+*.iws
+*.ipr
+*.sublime-workspace
+*.sublime-project
+.project
+.cproject
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-config
+.IntelliJIdea*/
+.netbeans/nbproject/private/
+
+# ═════════════════════════════════════════════════════════════
+# Editor Temporary Files
+# ═════════════════════════════════════════════════════════════
+*~
 *.swp
 *.swo
+*.swptemp
+*.bak
+*.tmp
+*.rej
+*#
+
+# ═════════════════════════════════════════════════════════════
+# OS Files
+# ═════════════════════════════════════════════════════════════
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.cab
+
+# ═════════════════════════════════════════════════════════════
+# Docker & Container Files
+# ═════════════════════════════════════════════════════════════
+.docker/
+.dockerignore
+docker-compose.override.yml
+
+# ═════════════════════════════════════════════════════════════
+# Testing & Coverage
+# ═════════════════════════════════════════════════════════════
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+.nose*
+nosetests.xml
+xunit.xml
+coverage.xml
+*.cover
+
+# ═════════════════════════════════════════════════════════════
+# Build & Distribution
+# ═════════════════════════════════════════════════════════════
+dist/
+build/
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# ═════════════════════════════════════════════════════════════
+# Project-Specific
+# ═════════════════════════════════════════════════════════════
+Ani-Log/
+*.log
+*.sqlite
+*.sqlite3
+.cache/
