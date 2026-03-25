@@ -75,23 +75,6 @@ class CharacterUpdateRequest(BaseModel):
     description: str | None = None
 
 
-# ─── Scene ───────────────────────────────────────────────────
-class SceneResponse(BaseModel):
-    id: str
-    session_id: str
-    scene_index: int
-    start_time: float
-    end_time: float | None
-    thumbnail_url: str | None = None
-    description: str | None = None
-    location: str | None = None
-    characters: list[CharacterResponse] = []
-    items: list["ItemResponse"] = []
-
-    class Config:
-        from_attributes = True
-
-
 # ─── Appearance ──────────────────────────────────────────────
 class AppearanceResponse(BaseModel):
     id: str
@@ -112,6 +95,23 @@ class ItemResponse(BaseModel):
     confidence: float
     timestamp: float
     bbox: list[float] | None = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Scene ───────────────────────────────────────────────────
+class SceneResponse(BaseModel):
+    id: str
+    session_id: str
+    scene_index: int
+    start_time: float
+    end_time: float | None
+    thumbnail_url: str | None = None
+    description: str | None = None
+    location: str | None = None
+    characters: list[CharacterResponse] = []
+    items: list[ItemResponse] = []
 
     class Config:
         from_attributes = True
@@ -174,3 +174,7 @@ class FrameAnalysis(BaseModel):
     detections: list[Detection]
     scene_changed: bool
     embedding: list[float] | None = None
+
+
+# Resolve forward references for Python 3.11 + pydantic v2 runtime.
+CharacterDetailResponse.model_rebuild()
