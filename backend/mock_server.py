@@ -714,7 +714,7 @@ def _capture_loop(
     adaptive_keyframes: bool,
     detection_stride: int,
     keyframe_threshold: float = 14.0,
-    max_keyframe_gap_sec: float = 4.0,
+    max_keyframe_gap_sec: float = 2.0,
 ):
     """Background thread: captures the screen using mss at the given FPS."""
     session_dir = DATA_DIR / session_id / "scenes"
@@ -848,7 +848,7 @@ def start_capture(req: CaptureStartRequest):
     _capture_stop_event.clear()
     _capture_thread = threading.Thread(
         target=_capture_loop,
-        args=(session_id, effective_fps, _capture_stop_event, adaptive_keyframes, detection_stride),
+        args=(session_id, effective_fps, _capture_stop_event, adaptive_keyframes, detection_stride, 14.0, 1.0 if req.performance_mode else 2.0),
         daemon=True,
     )
     _capture_thread.start()

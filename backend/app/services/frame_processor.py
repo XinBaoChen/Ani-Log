@@ -47,7 +47,7 @@ class FrameProcessor:
         self._performance_mode: bool = False
         self._adaptive_keyframes: bool = False
         self._adaptive_threshold: float = 12.0
-        self._adaptive_keepalive_sec: float = 4.0
+        self._adaptive_keepalive_sec: float = 2.0
         self._last_adaptive_frame_small: np.ndarray | None = None
         self._last_adaptive_saved_ts: float = 0.0
         self._current_scene_id: str | None = None
@@ -102,6 +102,7 @@ class FrameProcessor:
         self._performance_mode = bool(performance_mode)
         self._adaptive_keyframes = bool(adaptive_keyframes or performance_mode)
         self._fps = max(requested_fps, 6) if self._performance_mode else requested_fps
+        self._adaptive_keepalive_sec = 1.0 if self._performance_mode else 2.0
         self._last_adaptive_frame_small = None
         self._last_adaptive_saved_ts = 0.0
         self._last_keyframe_time = 0.0
