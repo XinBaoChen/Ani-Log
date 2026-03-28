@@ -85,9 +85,12 @@ export interface CaptureStatus {
   session_id: string;
   status: string;
   total_frames: number;
+  skipped_frames?: number;
+  error_frames?: number;
   characters_found: number;
   scenes_detected: number;
   elapsed_seconds: number;
+  effective_fps?: number;
 }
 
 // ─── Story Arc ──────────────────────────────────────────────

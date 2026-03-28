@@ -24,9 +24,12 @@ class CaptureStatusResponse(BaseModel):
     session_id: str | None = None
     status: str
     total_frames: int
+    skipped_frames: int = 0
+    error_frames: int = 0
     characters_found: int
     scenes_detected: int
     elapsed_seconds: float
+    effective_fps: float = 0.0
 
 
 # ─── Session ─────────────────────────────────────────────────

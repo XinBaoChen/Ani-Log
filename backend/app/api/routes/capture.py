@@ -90,9 +90,12 @@ async def get_status():
         session_id=stats.get("session_id") or None,
         status="capturing" if stats["running"] else "idle",
         total_frames=stats["frame_count"],
+        skipped_frames=stats.get("skipped_frames", 0),
+        error_frames=stats.get("error_frames", 0),
         characters_found=characters_found,
         scenes_detected=scene_analyzer.scene_count,
         elapsed_seconds=stats["elapsed_seconds"],
+        effective_fps=stats.get("effective_fps", 0.0),
     )
 
 

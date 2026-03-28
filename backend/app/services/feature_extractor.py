@@ -244,13 +244,16 @@ class FeatureExtractor:
         Returns:
             Normalized feature vector
         """
-        tokens = self.tokenizer([text]).to(self._device)
         torch = _get_torch()
-        if torch is None or self.model is None:
+        model = self.model
+        tokenizer = self.tokenizer
+        if torch is None or model is None or tokenizer is None:
             return np.zeros(REID_DIM, dtype=np.float32)
 
+        tokens = tokenizer([text]).to(self._device)
+
         with torch.no_grad():
-            features = self.model.encode_text(tokens)
+            features = model.encode_text(tokens)
             features = features / features.norm(dim=-1, keepdim=True)
 
         return self._to_reid_dim(features.cpu().numpy().flatten())
@@ -261,7 +264,7 @@ class FeatureExtractor:
 
     def batch_extract(self, frame: np.ndarray, bboxes: list[list[float]]) -> list[np.ndarray]:
         """Extract features from multiple bounding boxes in a single frame."""
-        if self.model is None:
+        if not bboxes:
             return []
         return [self.extract_from_frame(frame, bbox) for bbox in bboxes]
 

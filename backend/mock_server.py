@@ -52,6 +52,7 @@ _capture_thread: Optional[threading.Thread] = None
 _capture_stop_event = threading.Event()
 _capture_frame_characters: dict[int, list[str]] = {}
 _capture_unique_characters: set[str] = set()
+_recent_detections: list[dict[str, Any]] = []
 _face_cascade: Any = None
 _hog_detector: Any = None
 
@@ -412,6 +413,43 @@ def _clamp01(v: float) -> float:
     return max(0.0, min(1.0, v))
 
 
+def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, aw, ah = a
+    bx1, by1, bw, bh = b
+    ax2, ay2 = ax1 + aw, ay1 + ah
+    bx2, by2 = bx1 + bw, by1 + bh
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+
+    area_a = max(1, aw * ah)
+    area_b = max(1, bw * bh)
+    union = area_a + area_b - inter
+    return float(inter / max(1, union))
+
+
+def _nms_detections(
+    detections: list[tuple[int, int, int, int, float, str]],
+    iou_threshold: float = 0.35,
+) -> list[tuple[int, int, int, int, float, str]]:
+    """Suppress overlapping detections to avoid duplicate character creation."""
+    if not detections:
+        return []
+
+    dets = sorted(detections, key=lambda d: d[4], reverse=True)
+    kept: list[tuple[int, int, int, int, float, str]] = []
+    for d in dets:
+        box_d = (d[0], d[1], d[2], d[3])
+        if any(_bbox_iou(box_d, (k[0], k[1], k[2], k[3])) >= iou_threshold for k in kept):
+            continue
+        kept.append(d)
+    return kept
+
+
 def _face_confidence(img_w: int, img_h: int, box_w: int, box_h: int) -> float:
     area = float(max(1, box_w * box_h)) / float(max(1, img_w * img_h))
     # Heuristic confidence: larger stable face boxes are usually stronger detections.
@@ -530,7 +568,23 @@ def _dedup_characters(session_id: str) -> int:
 
     to_remove = set(remap.keys())
     _characters[:] = [c for c in _characters if c["id"] not in to_remove]
+    _compact_auto_character_names(session_id)
     return len(to_remove)
+
+
+def _compact_auto_character_names(session_id: str) -> None:
+    """Rename auto-generated names to a compact sequence per session.
+
+    Keeps manually-assigned names unchanged while making auto labels stable
+    and easier to track (Detected Character 1..N).
+    """
+    scoped = [
+        c for c in _characters
+        if (c.get("metadata") or {}).get("session_id") == session_id and _is_auto_named(c)
+    ]
+    scoped.sort(key=lambda c: int(c.get("appearance_count", 0)), reverse=True)
+    for idx, ch in enumerate(scoped, start=1):
+        ch["name"] = f"{AUTO_NAME_PREFIX} {idx}"
 
 
 def _dedup_existing_characters() -> int:
@@ -565,16 +619,44 @@ def _match_or_create_character(
     crop_rgb: Image.Image,
     detection_confidence: float,
     detector_source: str,
-) -> str:
+    bbox: tuple[int, int, int, int],
+) -> Optional[str]:
     """Match a detected face to an existing character or create a new one."""
     crop_bgr = cv2.cvtColor(np.array(crop_rgb), cv2.COLOR_RGB2BGR)
     feat = _face_feature(crop_bgr)
+
+    # Fast path: reuse the previous-frame identity if overlap + feature look close.
+    for prev in _recent_detections:
+        prev_id = str(prev.get("id", ""))
+        prev_box = prev.get("bbox")
+        prev_feat = prev.get("feature")
+        if not prev_id or not isinstance(prev_box, tuple) or not isinstance(prev_feat, list):
+            continue
+        if _bbox_iou(bbox, prev_box) < 0.38:
+            continue
+        if _feature_distance(feat, prev_feat) <= 0.68:
+            for ch in _characters:
+                if ch.get("id") == prev_id:
+                    prev_count = int(ch.get("appearance_count", 0))
+                    prev_conf = _character_confidence(ch) or 0.0
+                    ch["appearance_count"] = prev_count + 1
+                    ch["confidence"] = ((prev_conf * prev_count) + detection_confidence) / max(1, prev_count + 1)
+                    meta = ch.get("metadata") or {}
+                    meta["last_seen_frame"] = frame_idx
+                    meta["last_session_id"] = session_id
+                    meta["source"] = detector_source
+                    meta["confidence"] = ch["confidence"]
+                    meta["feature"] = feat
+                    ch["metadata"] = meta
+                    return prev_id
 
     # Match only against characters discovered from captured sessions.
     best_id: Optional[str] = None
     best_dist = 999.0
     for ch in _characters:
         meta = ch.get("metadata") or {}
+        if meta.get("session_id") != session_id:
+            continue
         stored = meta.get("feature")
         if not stored:
             continue
@@ -583,7 +665,7 @@ def _match_or_create_character(
             best_dist = d
             best_id = ch.get("id")
 
-    if best_id is not None and best_dist <= 0.50:
+    if best_id is not None and best_dist <= 0.64:
         for ch in _characters:
             if ch.get("id") == best_id:
                 prev_count = int(ch.get("appearance_count", 0))
@@ -607,6 +689,10 @@ def _match_or_create_character(
                 meta["confidence"] = ch["confidence"]
                 ch["metadata"] = meta
                 return best_id
+
+    # Guardrail: ignore weak detections to prevent duplicate spam cards.
+    if detection_confidence < 0.62:
+        return None
 
     # New discovered character.
     char_id = f"char-{uuid.uuid4().hex[:8]}"
@@ -633,6 +719,7 @@ def _match_or_create_character(
             "feature": feat,
         },
     })
+    _compact_auto_character_names(session_id)
     return char_id
 
 
@@ -669,13 +756,36 @@ def _detect_characters(session_id: str, frame_idx: int, pil_img: Image.Image) ->
             for (x, y, w, h), wt in list(zip(rects, weights))[:4]
         ]
 
+    detections = _nms_detections(detections)
+
+    current_tracks: list[dict[str, Any]] = []
     for (x, y, w, h, conf, source) in detections:
         x1, y1 = max(0, int(x)), max(0, int(y))
         x2, y2 = min(pil_img.width, int(x + w)), min(pil_img.height, int(y + h))
         if x2 <= x1 or y2 <= y1:
             continue
         crop = pil_img.crop((x1, y1, x2, y2))
-        ids.append(_match_or_create_character(session_id, frame_idx, crop, conf, source))
+        cid = _match_or_create_character(
+            session_id=session_id,
+            frame_idx=frame_idx,
+            crop_rgb=crop,
+            detection_confidence=conf,
+            detector_source=source,
+            bbox=(x1, y1, x2 - x1, y2 - y1),
+        )
+        if cid:
+            ids.append(cid)
+            meta = next((c.get("metadata") for c in _characters if c.get("id") == cid), None) or {}
+            feat = meta.get("feature")
+            if isinstance(feat, list):
+                current_tracks.append({
+                    "id": cid,
+                    "bbox": (x1, y1, x2 - x1, y2 - y1),
+                    "feature": feat,
+                })
+
+    global _recent_detections
+    _recent_detections = current_tracks[:8]
 
     # Deduplicate while preserving order.
     uniq_ids = list(dict.fromkeys(ids))
@@ -726,6 +836,8 @@ def _capture_loop(
     last_saved_ts = 0.0
     _capture_frame_characters.clear()
     _capture_unique_characters.clear()
+    global _recent_detections
+    _recent_detections = []
 
     with mss.mss() as sct:
         monitor = sct.monitors[1]  # primary monitor

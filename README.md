@@ -82,28 +82,39 @@ Open the dashboard at http://localhost:3000
 
 ---
 
-### Option B — Manual Setup
+### Option B — Manual Setup (Windows-first)
 
-```bash
-# Backend
+```powershell
+# Backend (Windows PowerShell)
 cd backend
-python -m venv venv
-source venv/bin/activate    # Windows: venv\Scripts\activate
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 
-# C++ Capture Engine
+# C++ Capture Engine (new PowerShell terminal)
 cd capture_engine
-mkdir build && cd build
+mkdir build
+cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release
 
-# Frontend
+# Frontend (new PowerShell terminal)
 cd frontend
 npm install
-npm run dev
+npm run dev -- --port 3001
 ```
-# Backend
+
+```bash
+# Linux/macOS optional variant
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
+
+# Mock mode (lightweight, no ML/GPU)
 cd backend
 python mock_server.py
 
