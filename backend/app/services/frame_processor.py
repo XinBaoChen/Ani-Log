@@ -16,6 +16,7 @@ import zmq
 import zmq.asyncio
 from pathlib import Path
 from datetime import datetime
+from sqlalchemy import select
 from loguru import logger
 
 from app.core.config import settings
@@ -40,6 +41,8 @@ class FrameProcessor:
         self._running = False
         self._session_id: str | None = None
         self._frame_count = 0
+        self._skipped_frames = 0
+        self._error_frames = 0
         self._start_time = 0.0
         self._capture: mss.mss | None = None
         self._data_dir = settings.data_dir.resolve()   # always absolute
@@ -63,11 +66,15 @@ class FrameProcessor:
     @property
     def stats(self) -> dict:
         elapsed = time.time() - self._start_time if self._running else 0
+        effective_fps = (self._frame_count / elapsed) if elapsed > 0 else 0.0
         return {
             "session_id": self._session_id,
             "running": self._running,
             "frame_count": self._frame_count,
+            "skipped_frames": self._skipped_frames,
+            "error_frames": self._error_frames,
             "elapsed_seconds": elapsed,
+            "effective_fps": effective_fps,
             "fps": self._fps,
             "performance_mode": self._performance_mode,
             "adaptive_keyframes": self._adaptive_keyframes,
@@ -97,6 +104,8 @@ class FrameProcessor:
         self._running = True
         self._session_id = session_id
         self._frame_count = 0
+        self._skipped_frames = 0
+        self._error_frames = 0
         self._start_time = time.time()
         requested_fps = fps or settings.capture_fps
         self._performance_mode = bool(performance_mode)
@@ -185,6 +194,17 @@ class FrameProcessor:
                 row.total_frames = self._frame_count
                 await db.commit()
 
+        # Close final open scene if capture ended without another cut.
+        if self._current_scene_id:
+            async with async_session() as db:
+                from sqlalchemy import select
+
+                result = await db.execute(select(Scene).where(Scene.id == self._current_scene_id))
+                row = result.scalar_one_or_none()
+                if row and row.end_time is None:
+                    row.end_time = max(0.0, time.time() - self._start_time)
+                    await db.commit()
+
         try:
             await self._merge_session_character_duplicates(session_id)
         except Exception as exc:
@@ -216,7 +236,14 @@ class FrameProcessor:
             await db.commit()
             self._auto_character_counter += 1
 
-    async def _persist_scene(self, scene_index: int, timestamp: float, thumb_path: str):
+    async def _persist_scene(
+        self,
+        scene_index: int,
+        timestamp: float,
+        thumb_path: str,
+        description: str | None = None,
+        location: str | None = None,
+    ):
         """Save a Scene row to SQLite."""
         scene_id = str(uuid.uuid4())
         self._current_scene_id = scene_id
@@ -229,6 +256,8 @@ class FrameProcessor:
                 scene_index=scene_index,
                 start_time=timestamp,
                 thumbnail_path=thumb_path,
+                description=description,
+                location=location,
             )
             db.add(scene)
             await db.commit()
@@ -253,8 +282,92 @@ class FrameProcessor:
                 bbox=bbox,
             )
             db.add(app)
+            result = await db.execute(select(Character).where(Character.id == character_id))
+            character = result.scalar_one_or_none()
+            if character:
+                character.appearance_count = int(character.appearance_count or 0) + 1
             await db.commit()
         self._last_appearance_ts[key] = timestamp
+
+    async def _persist_items(
+        self,
+        scene_id: str,
+        detections: list[Detection],
+        frame: np.ndarray,
+        timestamp: float,
+    ) -> None:
+        """Persist non-character detections as scene items and add search embeddings."""
+        if not detections:
+            return
+
+        extractor = get_feature_extractor()
+        vector_store = get_vector_store()
+
+        async with async_session() as db:
+            for det in detections:
+                if det.label in ("person", "character", "face"):
+                    continue
+                if det.confidence < 0.45:
+                    continue
+
+                item_id = str(uuid.uuid4())
+                item = DetectedItem(
+                    id=item_id,
+                    scene_id=scene_id,
+                    label=det.label,
+                    category=self._infer_item_category(det.label),
+                    confidence=float(det.confidence),
+                    bbox=det.bbox,
+                    timestamp=timestamp,
+                )
+                db.add(item)
+
+                emb = extractor.extract_from_frame(frame, det.bbox)
+                if emb is not None and float(np.linalg.norm(emb)) > 0:
+                    vector_store.add_item(
+                        item_id=item_id,
+                        embedding=emb,
+                        metadata={
+                            "label": det.label,
+                            "category": item.category,
+                            "scene_id": scene_id,
+                            "confidence": float(det.confidence),
+                        },
+                    )
+
+            await db.commit()
+
+    @staticmethod
+    def _infer_item_category(label: str) -> str:
+        low = label.lower()
+        if low in {"building", "castle", "house", "temple", "school", "forest", "mountain", "ocean", "sky"}:
+            return "location"
+        if low in {"sword", "weapon", "gun", "shield", "staff", "bow"}:
+            return "weapon"
+        if low in {"car", "vehicle", "ship", "mech", "robot"}:
+            return "vehicle"
+        return "item"
+
+    @staticmethod
+    def _scene_summary_from_detections(detections: list[Detection]) -> tuple[str | None, str | None]:
+        if not detections:
+            return None, None
+
+        labels = [d.label for d in detections if d.confidence >= 0.40]
+        if not labels:
+            return None, None
+
+        top = sorted(set(labels), key=lambda x: labels.count(x), reverse=True)
+        head = ", ".join(top[:3])
+        description = f"Key elements: {head}"
+
+        location = None
+        for candidate in ("castle", "school", "temple", "forest", "mountain", "ocean", "building", "house"):
+            if candidate in top:
+                location = candidate
+                break
+
+        return description, location
 
     async def _merge_session_character_duplicates(self, session_id: str):
         """Cluster-by-embedding and merge near-duplicate characters in a session."""
@@ -433,24 +546,58 @@ class FrameProcessor:
             cv2.imwrite(str(thumb_path), thumbnail, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
             # Close previous scene's end_time
-            if self._current_scene_id:
+            previous_scene_id = self._current_scene_id
+            if previous_scene_id:
                 async with async_session() as db:
                     from sqlalchemy import select
 
                     result = await db.execute(
-                        select(Scene).where(Scene.id == self._current_scene_id)
+                        select(Scene).where(Scene.id == previous_scene_id)
                     )
                     prev = result.scalar_one_or_none()
                     if prev:
                         prev.end_time = timestamp
                         await db.commit()
 
+            description, location = self._scene_summary_from_detections(detections)
+
             # Store path relative to data_dir so it maps to /data/{rel} URL
             rel_thumb = thumb_path.relative_to(self._data_dir.resolve())
-            await self._persist_scene(
+            new_scene_id = await self._persist_scene(
                 scene_index=scene_analyzer.scene_count,
                 timestamp=timestamp,
                 thumb_path=rel_thumb.as_posix(),
+                description=description,
+                location=location,
+            )
+
+            # Add semantic embedding for scene search.
+            try:
+                from PIL import Image
+
+                extractor = get_feature_extractor()
+                rgb_thumb = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB)
+                emb = extractor.extract_image_features(Image.fromarray(rgb_thumb))
+                if emb is not None and float(np.linalg.norm(emb)) > 0:
+                    get_vector_store().add_scene(
+                        scene_id=new_scene_id,
+                        embedding=emb,
+                        metadata={
+                            "session_id": self._session_id,
+                            "label": f"Scene {scene_analyzer.scene_count}",
+                            "description": description,
+                            "location": location,
+                            "thumbnail_url": f"/data/{rel_thumb.as_posix()}",
+                        },
+                    )
+            except Exception as exc:
+                logger.debug(f"Scene embedding skipped: {exc}")
+
+            await self._persist_items(
+                scene_id=new_scene_id,
+                detections=detections,
+                frame=frame,
+                timestamp=timestamp,
             )
 
         self._frame_count += 1
@@ -482,6 +629,7 @@ class FrameProcessor:
                 timestamp = time.time() - self._start_time
 
                 if not self._should_process_frame(frame, timestamp):
+                    self._skipped_frames += 1
                     elapsed = time.time() - start
                     sleep_time = interval - elapsed
                     if sleep_time > 0.001:
@@ -494,6 +642,7 @@ class FrameProcessor:
                 try:
                     await self.process_frame(frame, timestamp)
                 except Exception as frame_err:
+                    self._error_frames += 1
                     logger.warning(f"Frame {self._frame_count} processing error (skipping): {frame_err}")
 
                 # Maintain target FPS — only sleep if we have time left
@@ -537,9 +686,15 @@ class FrameProcessor:
                     continue
 
                 if not self._should_process_frame(frame, ts):
+                    self._skipped_frames += 1
                     continue
 
-                analysis = await self.process_frame(frame, ts)
+                try:
+                    analysis = await self.process_frame(frame, ts)
+                except Exception as frame_err:
+                    self._error_frames += 1
+                    logger.warning(f"ZMQ frame processing error (skipping): {frame_err}")
+                    continue
 
                 # Send result summary back to C++ engine
                 try:
