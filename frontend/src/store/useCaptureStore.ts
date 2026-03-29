@@ -4,8 +4,11 @@ type CaptureStatus = "idle" | "starting" | "capturing" | "stopping";
 
 interface CaptureStats {
   totalFrames: number;
+  skippedFrames: number;
+  errorFrames: number;
   charactersFound: number;
   scenesDetected: number;
+  effectiveFps: number;
   elapsed: number;
 }
 
@@ -23,8 +26,11 @@ export const useCaptureStore = create<CaptureState>((set) => ({
   sessionId: null,
   stats: {
     totalFrames: 0,
+    skippedFrames: 0,
+    errorFrames: 0,
     charactersFound: 0,
     scenesDetected: 0,
+    effectiveFps: 0,
     elapsed: 0,
   },
 

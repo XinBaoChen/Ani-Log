@@ -97,8 +97,11 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
         const data = await api.getCaptureStatus();
         setStats({
           totalFrames: data.total_frames,
+          skippedFrames: data.skipped_frames ?? 0,
+          errorFrames: data.error_frames ?? 0,
           charactersFound: data.characters_found,
           scenesDetected: data.scenes_detected,
+          effectiveFps: data.effective_fps ?? 0,
           elapsed: data.elapsed_seconds,
         });
         if (data.status === "capturing") {

@@ -4,13 +4,14 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import {
   MonitorPlay,
-  Play,
-  Square,
   Settings,
   Activity,
   Users,
   Film,
   Sparkles,
+  Gauge,
+  SkipForward,
+  AlertTriangle,
 } from "lucide-react";
 import CaptureControl from "@/components/CaptureControl";
 import StoryArcSummary from "@/components/StoryArcSummary";
@@ -50,7 +51,7 @@ export default function CapturePage() {
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.1 }}
-        className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"
+        className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6"
       >
         {[
           {
@@ -70,6 +71,24 @@ export default function CapturePage() {
             label: "Scenes",
             value: stats.scenesDetected,
             color: "text-accent-blue",
+          },
+          {
+            icon: Gauge,
+            label: "Effective FPS",
+            value: stats.effectiveFps.toFixed(2),
+            color: "text-emerald-400",
+          },
+          {
+            icon: SkipForward,
+            label: "Skipped",
+            value: stats.skippedFrames,
+            color: "text-yellow-400",
+          },
+          {
+            icon: AlertTriangle,
+            label: "Errors",
+            value: stats.errorFrames,
+            color: "text-red-400",
           },
           {
             icon: Sparkles,
