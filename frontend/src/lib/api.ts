@@ -77,6 +77,47 @@ export const api = {
 
   getSessionScenes: (id: string) => request<Scene[]>(`/api/sessions/${id}/scenes`),
 
+  autoNameSession: (id: string, animeTitle?: string) => {
+    const query = animeTitle
+      ? `?anime_title=${encodeURIComponent(animeTitle)}`
+      : "";
+    return request<{
+      status: string;
+      session_id: string;
+      title: string;
+      merged: number;
+      character_count: number;
+      names: string[];
+    }>(`/api/sessions/${id}/auto-name${query}`, {
+      method: "POST",
+    });
+  },
+
+  autoNameAllSessions: (animeTitle?: string) => {
+    const query = animeTitle
+      ? `?anime_title=${encodeURIComponent(animeTitle)}`
+      : "";
+    return request<{
+      status: string;
+      total_sessions: number;
+      total_merged: number;
+      total_assigned: number;
+      total_unknown: number;
+      sessions: Array<{
+        session_id: string;
+        title: string;
+        merged: number;
+        naming: {
+          assigned: number;
+          unknown: number;
+          mode: string;
+        };
+      }>;
+    }>(`/api/sessions/auto-name-all${query}`, {
+      method: "POST",
+    });
+  },
+
   deleteSession: (id: string) =>
     request<void>(`/api/sessions/${id}`, { method: "DELETE" }),
 

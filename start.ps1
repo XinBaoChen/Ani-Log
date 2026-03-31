@@ -4,7 +4,12 @@
 $root    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $backend = Join-Path $root "backend"
 $frontend= Join-Path $root "frontend"
-$python  = "G:/Github_Project/Portfolio/.venv/Scripts/python.exe"
+$python  = Join-Path $root ".venv\Scripts\python.exe"
+
+if (-not (Test-Path $python)) {
+    Write-Host "  ⚠️ Local .venv not found. Falling back to system python." -ForegroundColor Yellow
+    $python = "python"
+}
 
 Write-Host "🎌 Starting Ani-Log..." -ForegroundColor Cyan
 
