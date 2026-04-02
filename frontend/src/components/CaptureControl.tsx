@@ -13,7 +13,8 @@ interface CaptureControlProps {
 
 export default function CaptureControl({ fullView }: CaptureControlProps) {
   const { status, setStatus, setStats, setSessionId } = useCaptureStore();
-  const [title, setTitle] = useState("My Anime Session");
+  const [title, setTitle] = useState("");
+  const [titleError, setTitleError] = useState<string | null>(null);
   const [fps, setFps] = useState(2);
   const [preset, setPreset] = useState<"balanced" | "performance">("balanced");
   const [lastSessionId, setLastSessionId] = useState<string | null>(null);
@@ -47,11 +48,27 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
   }, []);
 
   const handleStart = async () => {
+    const normalizedTitle = title.trim().toLowerCase();
+    const genericTitles = new Set([
+      "",
+      "my anime session",
+      "character test",
+      "character detection validation",
+      "balanced stress smoke",
+      "perf stress smoke",
+    ]);
+    if (genericTitles.has(normalizedTitle)) {
+      setTitleError("Enter the anime title (example: Karakai Jouzu no Takagi-san) so character names can be assigned correctly.");
+      setStatus("idle");
+      return;
+    }
+
+    setTitleError(null);
     try {
       setStatus("starting");
       const isPerformance = preset === "performance";
       const response = await api.startCapture({
-        title,
+        title: title.trim(),
         fps: isPerformance ? 6 : fps,
         source: "screen",
         performance_mode: isPerformance,
@@ -168,11 +185,19 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
           <input
             type="text"
             value={title}
-            onChange={(e) => setTitle(e.target.value)}
+            onChange={(e) => {
+              setTitle(e.target.value);
+              if (titleError) setTitleError(null);
+            }}
             className="search-input text-sm"
-            placeholder="My Anime Session"
+            placeholder="Anime title (example: Karakai Jouzu no Takagi-san)"
             disabled={status === "capturing"}
           />
+          {titleError && (
+            <p className="text-[11px] text-red-400 mt-1">
+              {titleError}
+            </p>
+          )}
         </div>
 
         <div>

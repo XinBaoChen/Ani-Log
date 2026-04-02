@@ -9,6 +9,7 @@ interface CharacterCardProps {
   data: SearchResult;
   onDelete?: () => void;
   onRename?: (newName: string) => void;
+  showTypeBadge?: boolean;
 }
 
 const typeConfig = {
@@ -35,7 +36,7 @@ function confColor(pct: number): string {
   return "text-orange-400";
 }
 
-export default function CharacterCard({ data, onDelete, onRename }: CharacterCardProps) {
+export default function CharacterCard({ data, onDelete, onRename, showTypeBadge = true }: CharacterCardProps) {
   const config = typeConfig[data.type as keyof typeof typeConfig] ?? typeConfig.character;
   const Icon = config.icon;
   const [imgFailed, setImgFailed] = useState(false);
@@ -107,11 +108,13 @@ export default function CharacterCard({ data, onDelete, onRename }: CharacterCar
           <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/5 to-black/20" />
 
           {/* Type badge */}
-          <div className="absolute top-2.5 right-2.5">
-            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-md backdrop-blur-sm ${config.badgeCls}`}>
-              {data.type}
-            </span>
-          </div>
+          {showTypeBadge && (
+            <div className="absolute top-2.5 right-2.5">
+              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-md backdrop-blur-sm ${config.badgeCls}`}>
+                {data.type}
+              </span>
+            </div>
+          )}
 
           {/* Bottom info strip */}
           <div className="absolute bottom-0 left-0 right-0 px-3 py-3">
