@@ -19,6 +19,8 @@ import struct
 import zlib
 import threading
 import pathlib
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query
@@ -53,10 +55,54 @@ _capture_stop_event = threading.Event()
 _capture_frame_characters: dict[int, list[str]] = {}
 _capture_unique_characters: set[str] = set()
 _recent_detections: list[dict[str, Any]] = []
+_pending_candidates: dict[str, list[dict[str, Any]]] = {}
 _face_cascade: Any = None
 _hog_detector: Any = None
+_insightface_detector: Any = None
 
 AUTO_NAME_PREFIX = "Detected Character"
+UNKNOWN_NAME_PREFIX = "Unknown Character"
+
+GENERIC_SESSION_TITLES = {
+    "my anime session",
+    "character detection validation",
+    "character test",
+    "balanced stress smoke",
+    "perf stress smoke",
+}
+
+KNOWN_ANIME_ROSTERS: dict[str, list[str]] = {
+    "attack on titan": [
+        "Eren Yeager", "Mikasa Ackermann", "Armin Arlert", "Levi Ackermann",
+        "Hange Zoe", "Erwin Smith", "Historia Reiss", "Reiner Braun",
+        "Jean Kirstein", "Connie Springer", "Sasha Blouse", "Annie Leonhart",
+    ],
+    "demon slayer": [
+        "Tanjiro Kamado", "Nezuko Kamado", "Zenitsu Agatsuma", "Inosuke Hashibira",
+        "Kyojuro Rengoku", "Giyu Tomioka", "Shinobu Kocho", "Tengen Uzui",
+    ],
+    "jujutsu kaisen": [
+        "Yuji Itadori", "Megumi Fushiguro", "Nobara Kugisaki", "Satoru Gojo",
+        "Suguru Geto", "Kento Nanami", "Maki Zenin", "Yuta Okkotsu",
+    ],
+    "takagi": [
+        "Takagi", "Nishikata", "Mina Hibino", "Sanae Tsukimoto", "Yukari Tenkawa",
+    ],
+    "karakai jouzu no takagi": [
+        "Takagi", "Nishikata", "Mina Hibino", "Sanae Tsukimoto", "Yukari Tenkawa",
+    ],
+}
+
+_roster_cache: dict[str, list[str]] = {}
+_roster_entry_cache: dict[str, list[dict[str, Optional[str]]]] = {}
+
+# Optional CLIP labeling stack (lazy loaded)
+_torch = None
+_open_clip = None
+_clip_model = None
+_clip_preprocess = None
+_clip_tokenizer = None
+_clip_device = "cpu"
 
 _sessions = [
     {
@@ -295,6 +341,12 @@ class SummaryGenerateRequest(BaseModel):
     session_id: str
     scene_ids: Optional[list[str]] = None
 
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _now() -> str:
@@ -359,6 +411,89 @@ def _get_hog_detector() -> Any:
         hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
         _hog_detector = hog
     return _hog_detector
+
+
+def _get_insightface_detector() -> Any:
+    """Lazy-load InsightFace detector (popular robust face detector)."""
+    global _insightface_detector
+    if _insightface_detector is not None:
+        return _insightface_detector
+    try:
+        from insightface.app import FaceAnalysis  # noqa: PLC0415
+
+        app = FaceAnalysis(providers=["CPUExecutionProvider"])
+        app.prepare(ctx_id=-1, det_size=(640, 640))
+        _insightface_detector = app
+        return _insightface_detector
+    except Exception:
+        _insightface_detector = False
+        return None
+
+
+def _detect_faces_insightface(bgr: np.ndarray) -> list[tuple[int, int, int, int, float, str]]:
+    detector = _get_insightface_detector()
+    if detector is None:
+        return []
+    out: list[tuple[int, int, int, int, float, str]] = []
+    try:
+        faces = detector.get(bgr)
+    except Exception:
+        return []
+    for f in faces:
+        if not hasattr(f, "bbox"):
+            continue
+        x1, y1, x2, y2 = [int(v) for v in f.bbox.tolist()]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        score = float(getattr(f, "det_score", 0.9))
+        out.append((x1, y1, w, h, _clamp01(score), "insightface"))
+    return out
+
+
+def _smart_character_crop(pil_img: Image.Image, box: tuple[int, int, int, int]) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Refine a detection box so saved thumbnail focuses on visible character region."""
+    x1, y1, w, h = box
+    x2, y2 = x1 + w, y1 + h
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(pil_img.width, x2), min(pil_img.height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return pil_img.crop((0, 0, min(64, pil_img.width), min(64, pil_img.height))), (0, 0, min(64, pil_img.width), min(64, pil_img.height))
+
+    # Expand slightly upward and around to include hairstyle/head context.
+    bw, bh = x2 - x1, y2 - y1
+    ex = int(bw * 0.18)
+    ey_top = int(bh * 0.30)
+    ey_bottom = int(bh * 0.12)
+    rx1 = max(0, x1 - ex)
+    ry1 = max(0, y1 - ey_top)
+    rx2 = min(pil_img.width, x2 + ex)
+    ry2 = min(pil_img.height, y2 + ey_bottom)
+
+    crop = pil_img.crop((rx1, ry1, rx2, ry2))
+    arr = np.array(crop.convert("RGB"), dtype=np.uint8)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    # Use edges to remove low-information blank borders.
+    edges = cv2.Canny(gray, 60, 140)
+    ys, xs = np.where(edges > 0)
+    if len(xs) > 30 and len(ys) > 30:
+        lx = int(np.percentile(xs, 3))
+        rx = int(np.percentile(xs, 97))
+        ty = int(np.percentile(ys, 3))
+        by = int(np.percentile(ys, 97))
+        if rx > lx + 20 and by > ty + 20:
+            # small margin after trim
+            mx = max(2, int((rx - lx) * 0.08))
+            my = max(2, int((by - ty) * 0.08))
+            lx = max(0, lx - mx)
+            rx = min(arr.shape[1], rx + mx)
+            ty = max(0, ty - my)
+            by = min(arr.shape[0], by + my)
+            crop = Image.fromarray(arr[ty:by, lx:rx])
+            rx1, ry1 = rx1 + lx, ry1 + ty
+            rx2, ry2 = rx1 + (rx - lx), ry1 + (by - ty)
+
+    return crop, (rx1, ry1, rx2, ry2)
 
 
 def _face_feature(crop_bgr: np.ndarray) -> list[float]:
@@ -479,9 +614,412 @@ def _fallback_character_thumbnail(char_id: str) -> str:
     return f"/api/placeholder/{idx}?w=320&h=420"
 
 
+def _normalize_title(title: str) -> str:
+    norm = title.lower().replace("—", "-")
+    norm = " ".join(norm.replace("_", " ").replace("-", " ").split())
+    return norm.strip()
+
+
+def _get_session_title(session_id: str) -> str:
+    session = next((s for s in _sessions if s.get("id") == session_id), None)
+    if not session:
+        return ""
+    return str(session.get("title") or "")
+
+
+def _fetch_jikan_roster_entries(title: str, limit: int = 12) -> list[dict[str, Optional[str]]]:
+    """Best-effort roster fetch from Jikan API based on session title."""
+    try:
+        q = urllib.parse.quote(title)
+        search_url = f"https://api.jikan.moe/v4/anime?q={q}&limit=1"
+        with urllib.request.urlopen(search_url, timeout=3.5) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        data = payload.get("data") or []
+        if not data:
+            return []
+        anime_id = data[0].get("mal_id")
+        if not anime_id:
+            return []
+
+        char_url = f"https://api.jikan.moe/v4/anime/{anime_id}/characters"
+        with urllib.request.urlopen(char_url, timeout=3.5) as resp:
+            chars_payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        rows = chars_payload.get("data") or []
+
+        out: list[dict[str, Optional[str]]] = []
+        seen: set[str] = set()
+        for row in rows:
+            char = row.get("character") or {}
+            role = str(row.get("role") or "")
+            name = str(char.get("name") or "").strip()
+            if not name:
+                continue
+            if role not in ("Main", "Supporting"):
+                continue
+            if name in seen:
+                continue
+            images = char.get("images") or {}
+            jpg = images.get("jpg") or {}
+            webp = images.get("webp") or {}
+            image_url = (
+                jpg.get("image_url")
+                or jpg.get("large_image_url")
+                or webp.get("image_url")
+                or webp.get("large_image_url")
+            )
+            out.append({"name": name, "image_url": str(image_url) if image_url else None})
+            seen.add(name)
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _get_session_roster_entries(session_id: str) -> list[dict[str, Optional[str]]]:
+    title = _get_session_title(session_id)
+    norm = _normalize_title(title)
+    if not norm:
+        return []
+
+    if norm in _roster_entry_cache:
+        return _roster_entry_cache[norm]
+
+    for key, roster in KNOWN_ANIME_ROSTERS.items():
+        if key in norm:
+            entries = [{"name": n, "image_url": None} for n in roster]
+            _roster_entry_cache[norm] = entries
+            return entries
+
+    if norm in GENERIC_SESSION_TITLES:
+        _roster_entry_cache[norm] = []
+        return []
+
+    fetched = _fetch_jikan_roster_entries(title)
+    _roster_entry_cache[norm] = fetched
+    return fetched
+
+
+def _get_session_roster(session_id: str) -> list[str]:
+    title = _get_session_title(session_id)
+    norm = _normalize_title(title)
+    if not norm:
+        return []
+    if norm in _roster_cache:
+        return _roster_cache[norm]
+    entries = _get_session_roster_entries(session_id)
+    names = [str(e.get("name") or "").strip() for e in entries if str(e.get("name") or "").strip()]
+    _roster_cache[norm] = names
+    return names
+
+
+def _next_character_name_for_session(session_id: str) -> str:
+    roster = _get_session_roster(session_id)
+    if roster:
+        used = {
+            str(c.get("name", "")).strip()
+            for c in _characters
+            if (c.get("metadata") or {}).get("session_id") == session_id
+        }
+        for candidate in roster:
+            if candidate not in used:
+                return candidate
+
+    unknown_idx = 1 + sum(
+        1
+        for c in _characters
+        if (c.get("metadata") or {}).get("session_id") == session_id
+        and str(c.get("name", "")).startswith(UNKNOWN_NAME_PREFIX)
+    )
+    return f"{UNKNOWN_NAME_PREFIX} {unknown_idx}"
+
+
+def _get_torch():
+    global _torch
+    if _torch is None:
+        try:
+            import torch as _t  # noqa: PLC0415
+            _torch = _t
+        except Exception:
+            _torch = False
+    return None if _torch is False else _torch
+
+
+def _get_open_clip():
+    global _open_clip
+    if _open_clip is None:
+        try:
+            import open_clip as _oc  # noqa: PLC0415
+            _open_clip = _oc
+        except Exception:
+            _open_clip = False
+    return None if _open_clip is False else _open_clip
+
+
+def _ensure_clip_model() -> bool:
+    global _clip_model, _clip_preprocess, _clip_tokenizer, _clip_device
+    if _clip_model is not None and _clip_preprocess is not None and _clip_tokenizer is not None:
+        return True
+
+    torch = _get_torch()
+    open_clip = _get_open_clip()
+    if torch is None or open_clip is None:
+        return False
+
+    try:
+        _clip_device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "ViT-B-32",
+            pretrained="laion2b_s34b_b79k",
+            device=_clip_device,
+        )
+        tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        model.eval()
+        _clip_model = model
+        _clip_preprocess = preprocess
+        _clip_tokenizer = tokenizer
+        return True
+    except Exception:
+        return False
+
+
+def _clip_embed_image(img: Image.Image) -> Optional[np.ndarray]:
+    if not _ensure_clip_model():
+        return None
+    torch = _get_torch()
+    if torch is None:
+        return None
+    try:
+        with torch.no_grad():
+            tensor = _clip_preprocess(img).unsqueeze(0).to(_clip_device)
+            vec = _clip_model.encode_image(tensor)
+            vec = vec / vec.norm(dim=-1, keepdim=True)
+            return vec.cpu().numpy().flatten().astype(np.float32)
+    except Exception:
+        return None
+
+
+def _download_image(url: str) -> Optional[Image.Image]:
+    try:
+        with urllib.request.urlopen(url, timeout=4.5) as resp:
+            raw = resp.read()
+        with Image.open(io.BytesIO(raw)) as im:
+            return im.convert("RGB")
+    except Exception:
+        return None
+
+
+def _is_good_character_crop(img: Image.Image) -> bool:
+    w, h = img.size
+    if w < 40 or h < 40:
+        return False
+    gray = np.array(img.convert("L"), dtype=np.uint8)
+    # Basic focus check; blurry/noisy crops are not suitable for reliable naming.
+    focus = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return focus >= 35.0
+
+
+def _clip_embed_texts(texts: list[str]) -> Optional[np.ndarray]:
+    if not texts:
+        return None
+    if not _ensure_clip_model():
+        return None
+    torch = _get_torch()
+    if torch is None:
+        return None
+    try:
+        prompts = [f"anime portrait of {t}" for t in texts]
+        with torch.no_grad():
+            tok = _clip_tokenizer(prompts).to(_clip_device)
+            vec = _clip_model.encode_text(tok)
+            vec = vec / vec.norm(dim=-1, keepdim=True)
+            return vec.cpu().numpy().astype(np.float32)
+    except Exception:
+        return None
+
+
+def _resolve_thumbnail_local_path(url: Optional[str]) -> Optional[pathlib.Path]:
+    if not url:
+        return None
+    base_dir = (pathlib.Path(__file__).parent / "data").resolve()
+    u = str(url)
+    if u.startswith("/data/"):
+        rel = u[len("/data/"):]
+        p = (base_dir / rel).resolve()
+        if str(p).startswith(str(base_dir)) and p.exists():
+            return p
+    return None
+
+
+def _assign_names_for_session(session_id: str) -> dict[str, Any]:
+    """Assign best-effort character names for a session using roster + CLIP labeling."""
+    roster_entries = _get_session_roster_entries(session_id)
+    roster = [str(e.get("name") or "").strip() for e in roster_entries if str(e.get("name") or "").strip()]
+    auto_chars = [
+        c for c in _characters
+        if (c.get("metadata") or {}).get("session_id") == session_id and _is_auto_named(c)
+    ]
+    if not auto_chars:
+        return {"assigned": 0, "unknown": 0, "mode": "none"}
+
+    if not roster:
+        _compact_auto_character_names(session_id)
+        unknown = sum(1 for c in auto_chars if str(c.get("name", "")).startswith(UNKNOWN_NAME_PREFIX))
+        return {"assigned": 0, "unknown": unknown, "mode": "no_roster"}
+
+    text_mat = _clip_embed_texts(roster)
+
+    # Image-to-image labeling using roster portraits when available.
+    roster_img_indices: list[int] = []
+    roster_img_embs: list[np.ndarray] = []
+    for idx, entry in enumerate(roster_entries):
+        image_url = entry.get("image_url")
+        if not image_url:
+            continue
+        ref_img = _download_image(str(image_url))
+        if ref_img is None:
+            continue
+        rvec = _clip_embed_image(ref_img)
+        if rvec is None:
+            continue
+        roster_img_indices.append(idx)
+        roster_img_embs.append(rvec)
+    roster_img_mat = np.stack(roster_img_embs) if roster_img_embs else None
+
+    candidates: list[tuple[float, int, int]] = []
+
+    for ci, ch in enumerate(auto_chars):
+        path = _resolve_thumbnail_local_path(ch.get("thumbnail_url"))
+        if path is None:
+            continue
+        try:
+            with Image.open(path) as img:
+                rgb = img.convert("RGB")
+        except Exception:
+            continue
+
+        if not _is_good_character_crop(rgb):
+            continue
+
+        ivec = _clip_embed_image(rgb)
+        if ivec is None:
+            continue
+
+        # Prefer image-image similarity when roster portraits are available.
+        if roster_img_mat is not None:
+            sims_img = roster_img_mat @ ivec
+            for k, score in enumerate(sims_img.tolist()):
+                ni = roster_img_indices[k]
+                # Slight boost to image-match path over text-only path.
+                candidates.append((float(score + 0.05), ci, ni))
+
+        if text_mat is not None:
+            sims_txt = text_mat @ ivec
+            for ni, score in enumerate(sims_txt.tolist()):
+                candidates.append((float(score), ci, ni))
+
+    assigned_char: set[int] = set()
+    assigned_name: set[int] = set()
+    accepted: list[tuple[int, int, float]] = []
+
+    # Greedy bipartite assignment.
+    for score, ci, ni in sorted(candidates, key=lambda x: x[0], reverse=True):
+        if ci in assigned_char or ni in assigned_name:
+            continue
+        if score < 0.23:
+            continue
+        assigned_char.add(ci)
+        assigned_name.add(ni)
+        accepted.append((ci, ni, score))
+
+    # Apply assigned names first.
+    for ci, ni, score in accepted:
+        ch = auto_chars[ci]
+        ch["name"] = roster[ni]
+        meta = ch.get("metadata") or {}
+        meta["auto_name"] = True
+        meta["name_source"] = "clip_label"
+        meta["name_score"] = round(float(score), 4)
+        ch["metadata"] = meta
+
+    # Remaining auto chars become Unknown N.
+    unknown_idx = 1
+    assigned_ids = {id(auto_chars[ci]) for ci, _, _ in accepted}
+    for ch in auto_chars:
+        if id(ch) in assigned_ids:
+            continue
+        ch["name"] = f"{UNKNOWN_NAME_PREFIX} {unknown_idx}"
+        meta = ch.get("metadata") or {}
+        meta["auto_name"] = True
+        meta["name_source"] = "unknown_fallback"
+        ch["metadata"] = meta
+        unknown_idx += 1
+
+    # Refresh scene snapshots to show updated names immediately.
+    for sc in _scenes:
+        if sc.get("session_id") != session_id:
+            continue
+        seen: set[str] = set()
+        refreshed: list[dict] = []
+        for ch in sc.get("characters", []):
+            cid = str(ch.get("id", ""))
+            if not cid or cid in seen:
+                continue
+            real = next((c for c in _characters if str(c.get("id")) == cid), ch)
+            refreshed.append(_with_character_confidence(real))
+            seen.add(cid)
+        sc["characters"] = refreshed
+
+    return {
+        "assigned": len(accepted),
+        "unknown": max(0, len(auto_chars) - len(accepted)),
+        "mode": "clip" if candidates else "roster_only",
+    }
+
+
+def _create_character_from_detection(
+    session_id: str,
+    frame_idx: int,
+    crop_rgb: Image.Image,
+    detection_confidence: float,
+    detector_source: str,
+    feat: list[float],
+) -> str:
+    """Persist a newly confirmed character identity."""
+    char_id = f"char-{uuid.uuid4().hex[:8]}"
+    char_name = _next_character_name_for_session(session_id)
+    char_dir = DATA_DIR / session_id / "characters"
+    char_dir.mkdir(parents=True, exist_ok=True)
+    char_path = char_dir / f"{char_id}.jpg"
+    crop_rgb.save(str(char_path), "JPEG", quality=90)
+
+    _characters.append({
+        "id": char_id,
+        "name": char_name,
+        "description": "Auto-detected from capture (face-based matcher).",
+        "appearance_count": 1,
+        "confidence": detection_confidence,
+        "first_seen_at": _now(),
+        "thumbnail_url": f"/data/sessions/{session_id}/characters/{char_id}.jpg",
+        "metadata": {
+            "source": detector_source,
+            "session_id": session_id,
+            "first_seen_frame": frame_idx,
+            "confidence": detection_confidence,
+            "feature": feat,
+            "auto_name": True,
+        },
+    })
+    _compact_auto_character_names(session_id)
+    return char_id
+
+
 def _is_auto_named(ch: dict) -> bool:
+    meta = ch.get("metadata") or {}
+    if bool(meta.get("auto_name")):
+        return True
     name = str(ch.get("name", ""))
-    return name.startswith(AUTO_NAME_PREFIX)
+    return name.startswith(AUTO_NAME_PREFIX) or name.startswith(UNKNOWN_NAME_PREFIX)
 
 
 def _dedup_characters(session_id: str) -> int:
@@ -497,6 +1035,7 @@ def _dedup_characters(session_id: str) -> int:
         and (c.get("metadata") or {}).get("feature")
     ]
     if len(candidates) < 2:
+        _compact_auto_character_names(session_id)
         return 0
 
     parent: dict[str, str] = {c["id"]: c["id"] for c in candidates}
@@ -519,7 +1058,14 @@ def _dedup_characters(session_id: str) -> int:
         for j in range(i + 1, len(candidates)):
             b = candidates[j]
             feat_b = (b.get("metadata") or {}).get("feature", [])
-            if _feature_distance(feat_a, feat_b) <= 0.36:
+            dist = _feature_distance(feat_a, feat_b)
+            a_count = int(a.get("appearance_count", 0))
+            b_count = int(b.get("appearance_count", 0))
+            # Adaptive merge:
+            # - strict for stable identities
+            # - more permissive for low-count auto detections (common duplicates)
+            threshold = 0.72 if min(a_count, b_count) >= 4 else 0.92
+            if dist <= threshold:
                 union(a["id"], b["id"])
 
     groups: dict[str, list[dict]] = {}
@@ -544,7 +1090,28 @@ def _dedup_characters(session_id: str) -> int:
             keep["appearance_count"] = int(keep.get("appearance_count", 0)) + int(m.get("appearance_count", 0))
             remap[m["id"]] = keep["id"]
 
+    # Merge exact duplicate names inside the same session too.
+    by_name: dict[str, list[dict]] = {}
+    for c in _characters:
+        if (c.get("metadata") or {}).get("session_id") != session_id:
+            continue
+        nm = str(c.get("name") or "").strip().casefold()
+        if not nm:
+            continue
+        by_name.setdefault(nm, []).append(c)
+
+    for members in by_name.values():
+        if len(members) < 2:
+            continue
+        keep = sorted(members, key=lambda c: int(c.get("appearance_count", 0)), reverse=True)[0]
+        for m in members:
+            if m["id"] == keep["id"]:
+                continue
+            keep["appearance_count"] = int(keep.get("appearance_count", 0)) + int(m.get("appearance_count", 0))
+            remap[m["id"]] = keep["id"]
+
     if not remap:
+        _compact_auto_character_names(session_id)
         return 0
 
     for sc in _scenes:
@@ -575,16 +1142,46 @@ def _dedup_characters(session_id: str) -> int:
 def _compact_auto_character_names(session_id: str) -> None:
     """Rename auto-generated names to a compact sequence per session.
 
-    Keeps manually-assigned names unchanged while making auto labels stable
-    and easier to track (Detected Character 1..N).
+    Keeps manually-assigned names unchanged while making auto labels stable.
+    If the anime roster is known, assigns real character names first.
     """
     scoped = [
         c for c in _characters
         if (c.get("metadata") or {}).get("session_id") == session_id and _is_auto_named(c)
     ]
     scoped.sort(key=lambda c: int(c.get("appearance_count", 0)), reverse=True)
-    for idx, ch in enumerate(scoped, start=1):
-        ch["name"] = f"{AUTO_NAME_PREFIX} {idx}"
+
+    roster = _get_session_roster(session_id)
+    used_non_auto = {
+        str(c.get("name", "")).strip()
+        for c in _characters
+        if (c.get("metadata") or {}).get("session_id") == session_id and not _is_auto_named(c)
+    }
+
+    if roster:
+        r_idx = 0
+        for ch in scoped:
+            while r_idx < len(roster) and roster[r_idx] in used_non_auto:
+                r_idx += 1
+            if r_idx < len(roster):
+                ch["name"] = roster[r_idx]
+                used_non_auto.add(roster[r_idx])
+                ch_meta = ch.get("metadata") or {}
+                ch_meta["auto_name"] = True
+                ch["metadata"] = ch_meta
+                r_idx += 1
+            else:
+                break
+
+    unknown_idx = 1
+    for ch in scoped:
+        if _is_auto_named(ch) and ch.get("name") in roster:
+            continue
+        ch["name"] = f"{UNKNOWN_NAME_PREFIX} {unknown_idx}"
+        ch_meta = ch.get("metadata") or {}
+        ch_meta["auto_name"] = True
+        ch["metadata"] = ch_meta
+        unknown_idx += 1
 
 
 def _dedup_existing_characters() -> int:
@@ -600,6 +1197,149 @@ def _dedup_existing_characters() -> int:
     if merged:
         _save_state()
     return merged
+
+
+def _purge_repeated_characters() -> int:
+    """Cleanup pass for persisted data: merge duplicates and remove stale refs."""
+    merged = _dedup_existing_characters()
+
+    # Cross-session merge for auto-detected identities with very close features.
+    global_candidates = [
+        c for c in _characters
+        if (c.get("metadata") or {}).get("feature") and _is_auto_named(c)
+    ]
+
+    if len(global_candidates) >= 2:
+        parent: dict[str, str] = {c["id"]: c["id"] for c in global_candidates}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i in range(len(global_candidates)):
+            a = global_candidates[i]
+            fa = (a.get("metadata") or {}).get("feature", [])
+            for j in range(i + 1, len(global_candidates)):
+                b = global_candidates[j]
+                fb = (b.get("metadata") or {}).get("feature", [])
+                if _feature_distance(fa, fb) <= 0.84:
+                    union(a["id"], b["id"])
+
+        groups: dict[str, list[dict]] = {}
+        for c in global_candidates:
+            groups.setdefault(find(c["id"]), []).append(c)
+
+        remap: dict[str, str] = {}
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            keep = sorted(members, key=lambda c: int(c.get("appearance_count", 0)), reverse=True)[0]
+            for m in members:
+                if m["id"] == keep["id"]:
+                    continue
+                keep["appearance_count"] = int(keep.get("appearance_count", 0)) + int(m.get("appearance_count", 0))
+                remap[m["id"]] = keep["id"]
+
+        if remap:
+            for sc in _scenes:
+                seen: set[str] = set()
+                new_chars: list[dict] = []
+                for ch in sc.get("characters", []):
+                    cid = str(ch.get("id"))
+                    target_id = remap.get(cid, cid)
+                    if target_id in seen:
+                        continue
+                    target = next((c for c in _characters if c.get("id") == target_id), ch)
+                    new_chars.append(_with_character_confidence(target))
+                    seen.add(target_id)
+                sc["characters"] = new_chars
+
+            for k, ids in list(_capture_frame_characters.items()):
+                replaced = [remap.get(cid, cid) for cid in ids]
+                _capture_frame_characters[k] = list(dict.fromkeys(replaced))
+
+            to_remove = set(remap.keys())
+            _characters[:] = [c for c in _characters if c.get("id") not in to_remove]
+            merged += len(to_remove)
+
+    valid_ids = {str(c.get("id")) for c in _characters}
+
+    # Drop stale/duplicate scene references.
+    for sc in _scenes:
+        seen: set[str] = set()
+        cleaned: list[dict] = []
+        for ch in sc.get("characters", []):
+            cid = str(ch.get("id", ""))
+            if not cid or cid not in valid_ids or cid in seen:
+                continue
+            seen.add(cid)
+            real = next((c for c in _characters if str(c.get("id")) == cid), ch)
+            cleaned.append(_with_character_confidence(real))
+        sc["characters"] = cleaned
+
+    for k, ids in list(_capture_frame_characters.items()):
+        cleaned_ids = [cid for cid in ids if cid in valid_ids]
+        _capture_frame_characters[k] = list(dict.fromkeys(cleaned_ids))
+
+    # Prune weak one-off auto identities that commonly come from false detections.
+    pruned = 0
+    for sid in {
+        str((c.get("metadata") or {}).get("session_id"))
+        for c in _characters
+        if (c.get("metadata") or {}).get("session_id")
+    }:
+        session_chars = [
+            c for c in _characters
+            if (c.get("metadata") or {}).get("session_id") == sid and _is_auto_named(c)
+        ]
+        if len(session_chars) < 3:
+            continue
+
+        keep_ids: set[str] = set()
+        for c in session_chars:
+            conf = _character_confidence(c) or 0.0
+            count = int(c.get("appearance_count", 0))
+            if count >= 2 or conf >= 0.86:
+                keep_ids.add(str(c.get("id")))
+
+        # Ensure we keep at least one auto identity per session.
+        if not keep_ids and session_chars:
+            best = sorted(session_chars, key=lambda c: int(c.get("appearance_count", 0)), reverse=True)[0]
+            keep_ids.add(str(best.get("id")))
+
+        remove_ids = {
+            str(c.get("id"))
+            for c in session_chars
+            if str(c.get("id")) not in keep_ids
+        }
+        if not remove_ids:
+            continue
+
+        _characters[:] = [c for c in _characters if str(c.get("id")) not in remove_ids]
+        pruned += len(remove_ids)
+
+        for sc in _scenes:
+            seen: set[str] = set()
+            cleaned: list[dict] = []
+            for ch in sc.get("characters", []):
+                cid = str(ch.get("id", ""))
+                if cid in remove_ids or cid in seen:
+                    continue
+                real = next((c for c in _characters if str(c.get("id")) == cid), ch)
+                cleaned.append(_with_character_confidence(real))
+                seen.add(cid)
+            sc["characters"] = cleaned
+
+        _compact_auto_character_names(sid)
+
+    return merged + pruned
 
 
 def _with_character_confidence(ch: dict) -> dict:
@@ -665,7 +1405,7 @@ def _match_or_create_character(
             best_dist = d
             best_id = ch.get("id")
 
-    if best_id is not None and best_dist <= 0.64:
+    if best_id is not None and best_dist <= 0.78:
         for ch in _characters:
             if ch.get("id") == best_id:
                 prev_count = int(ch.get("appearance_count", 0))
@@ -691,36 +1431,87 @@ def _match_or_create_character(
                 return best_id
 
     # Guardrail: ignore weak detections to prevent duplicate spam cards.
-    if detection_confidence < 0.62:
+    if detection_confidence < 0.70:
         return None
 
-    # New discovered character.
-    char_id = f"char-{uuid.uuid4().hex[:8]}"
-    detected_idx = sum(1 for c in _characters if _is_auto_named(c)) + 1
-    char_name = f"{AUTO_NAME_PREFIX} {detected_idx}"
-    char_dir = DATA_DIR / session_id / "characters"
-    char_dir.mkdir(parents=True, exist_ok=True)
-    char_path = char_dir / f"{char_id}.jpg"
-    crop_rgb.save(str(char_path), "JPEG", quality=90)
+    # Cap the number of auto identities per session to reduce duplicate spam.
+    session_auto_chars = [
+        c for c in _characters
+        if (c.get("metadata") or {}).get("session_id") == session_id and _is_auto_named(c)
+    ]
+    if best_id is not None and len(session_auto_chars) >= 6:
+        for ch in _characters:
+            if ch.get("id") == best_id:
+                prev_count = int(ch.get("appearance_count", 0))
+                prev_conf = _character_confidence(ch) or 0.0
+                ch["appearance_count"] = prev_count + 1
+                ch["confidence"] = ((prev_conf * prev_count) + detection_confidence) / max(1, prev_count + 1)
+                meta = ch.get("metadata") or {}
+                meta["last_seen_frame"] = frame_idx
+                meta["last_session_id"] = session_id
+                meta["source"] = detector_source
+                meta["confidence"] = ch["confidence"]
+                ch["metadata"] = meta
+                return best_id
 
-    _characters.append({
-        "id": char_id,
-        "name": char_name,
-        "description": "Auto-detected from capture (face-based matcher).",
-        "appearance_count": 1,
-        "confidence": detection_confidence,
-        "first_seen_at": _now(),
-        "thumbnail_url": f"/data/sessions/{session_id}/characters/{char_id}.jpg",
-        "metadata": {
-            "source": detector_source,
-            "session_id": session_id,
-            "first_seen_frame": frame_idx,
-            "confidence": detection_confidence,
+    # New identity confirmation buffer: require repeated evidence before creating.
+    pending = _pending_candidates.setdefault(session_id, [])
+    pending[:] = [p for p in pending if frame_idx - int(p.get("last_frame", 0)) <= 15]
+
+    matched_pending: Optional[dict[str, Any]] = None
+    for p in pending:
+        p_feat = p.get("feature")
+        p_bbox = p.get("bbox")
+        if not isinstance(p_feat, list) or not isinstance(p_bbox, tuple):
+            continue
+        if _feature_distance(feat, p_feat) <= 0.90 or _bbox_iou(bbox, p_bbox) >= 0.35:
+            matched_pending = p
+            break
+
+    if matched_pending is None:
+        pending.append({
             "feature": feat,
-        },
-    })
-    _compact_auto_character_names(session_id)
-    return char_id
+            "bbox": bbox,
+            "hits": 1,
+            "last_frame": frame_idx,
+            "confidence": detection_confidence,
+            "source": detector_source,
+        })
+        return None
+
+    prev_hits = int(matched_pending.get("hits", 1))
+    matched_pending["hits"] = prev_hits + 1
+    matched_pending["last_frame"] = frame_idx
+    matched_pending["bbox"] = bbox
+    matched_pending["source"] = detector_source
+    matched_pending["confidence"] = (
+        (float(matched_pending.get("confidence", 0.0)) * prev_hits) + detection_confidence
+    ) / max(1, prev_hits + 1)
+
+    p_feat = matched_pending.get("feature") or feat
+    if isinstance(p_feat, list) and len(p_feat) == len(feat):
+        alpha = 0.3
+        updated = [(1 - alpha) * s + alpha * f for s, f in zip(p_feat, feat)]
+        norm = float(np.linalg.norm(updated))
+        if norm > 0:
+            updated = [v / norm for v in updated]
+        matched_pending["feature"] = updated
+    else:
+        matched_pending["feature"] = feat
+
+    # Require at least 3 consistent hits before creating a new DB character.
+    if int(matched_pending.get("hits", 0)) < 3:
+        return None
+
+    pending.remove(matched_pending)
+    return _create_character_from_detection(
+        session_id=session_id,
+        frame_idx=frame_idx,
+        crop_rgb=crop_rgb,
+        detection_confidence=float(matched_pending.get("confidence", detection_confidence)),
+        detector_source=str(matched_pending.get("source", detector_source)),
+        feat=(matched_pending.get("feature") or feat),
+    )
 
 
 def _detect_characters(session_id: str, frame_idx: int, pil_img: Image.Image) -> list[str]:
@@ -729,18 +1520,21 @@ def _detect_characters(session_id: str, frame_idx: int, pil_img: Image.Image) ->
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     cascade = _get_face_cascade()
 
-    faces = cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.08,
-        minNeighbors=4,
-        minSize=(36, 36),
-    )
-
     ids: list[str] = []
-    detections: list[tuple[int, int, int, int, float, str]] = [
-        (int(x), int(y), int(w), int(h), _face_confidence(pil_img.width, pil_img.height, int(w), int(h)), "opencv_haar_face")
-        for (x, y, w, h) in faces
-    ]
+    detections: list[tuple[int, int, int, int, float, str]] = _detect_faces_insightface(bgr)
+
+    # Fallback to Haar if InsightFace isn't available.
+    if len(detections) == 0:
+        faces = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(36, 36),
+        )
+        detections = [
+            (int(x), int(y), int(w), int(h), _face_confidence(pil_img.width, pil_img.height, int(w), int(h)), "opencv_haar_face")
+            for (x, y, w, h) in faces
+        ]
 
     # Fallback: if no faces are detected, try a person detector.
     if len(detections) == 0:
@@ -764,14 +1558,16 @@ def _detect_characters(session_id: str, frame_idx: int, pil_img: Image.Image) ->
         x2, y2 = min(pil_img.width, int(x + w)), min(pil_img.height, int(y + h))
         if x2 <= x1 or y2 <= y1:
             continue
-        crop = pil_img.crop((x1, y1, x2, y2))
+        crop, refined_box = _smart_character_crop(pil_img, (x1, y1, x2 - x1, y2 - y1))
+        if not _is_good_character_crop(crop):
+            continue
         cid = _match_or_create_character(
             session_id=session_id,
             frame_idx=frame_idx,
             crop_rgb=crop,
             detection_confidence=conf,
             detector_source=source,
-            bbox=(x1, y1, x2 - x1, y2 - y1),
+            bbox=(refined_box[0], refined_box[1], refined_box[2] - refined_box[0], refined_box[3] - refined_box[1]),
         )
         if cid:
             ids.append(cid)
@@ -780,7 +1576,7 @@ def _detect_characters(session_id: str, frame_idx: int, pil_img: Image.Image) ->
             if isinstance(feat, list):
                 current_tracks.append({
                     "id": cid,
-                    "bbox": (x1, y1, x2 - x1, y2 - y1),
+                    "bbox": (refined_box[0], refined_box[1], refined_box[2] - refined_box[0], refined_box[3] - refined_box[1]),
                     "feature": feat,
                 })
 
@@ -838,6 +1634,7 @@ def _capture_loop(
     _capture_unique_characters.clear()
     global _recent_detections
     _recent_detections = []
+    _pending_candidates[session_id] = []
 
     with mss.mss() as sct:
         monitor = sct.monitors[1]  # primary monitor
@@ -905,6 +1702,8 @@ def _capture_loop(
             sleep_time = interval - elapsed
             if sleep_time > 0:
                 stop_event.wait(sleep_time)
+
+    _pending_candidates.pop(session_id, None)
 
 
 @app.post("/api/capture/start")
@@ -996,6 +1795,13 @@ def stop_capture():
     if n_merged:
         print(f"[dedup] merged {n_merged} duplicate character(s) for session {sid[:8]}")
 
+    name_stats = _assign_names_for_session(sid)
+    if name_stats.get("assigned", 0) or name_stats.get("unknown", 0):
+        print(
+            f"[naming] assigned={name_stats.get('assigned', 0)} "
+            f"unknown={name_stats.get('unknown', 0)} mode={name_stats.get('mode')}"
+        )
+
     for s in _sessions:
         if s["id"] == sid:
             s["status"] = "stopped"
@@ -1060,9 +1866,43 @@ def list_characters(
     sort_by: str = Query("appearance_count"),
     limit: int = Query(50),
     offset: int = Query(0),
+    include_demo: bool = Query(False),
 ):
     _dedup_existing_characters()
     chars = list(_characters)
+
+    # If captured-session characters exist, hide seeded demo entries by default.
+    has_session_chars = any((c.get("metadata") or {}).get("session_id") for c in chars)
+    if has_session_chars and not include_demo:
+        chars = [c for c in chars if (c.get("metadata") or {}).get("session_id")]
+
+        # Consolidate named identities across sessions so the grid doesn't show
+        # multiple cards for the same character name.
+        merged_named: dict[str, dict] = {}
+        unknown_rows: list[dict] = []
+        for c in chars:
+            name = str(c.get("name") or "").strip()
+            if not name or name.startswith(UNKNOWN_NAME_PREFIX):
+                unknown_rows.append(c)
+                continue
+            key = name.casefold()
+            if key not in merged_named:
+                merged_named[key] = dict(c)
+                continue
+
+            cur = merged_named[key]
+            cur["appearance_count"] = int(cur.get("appearance_count", 0)) + int(c.get("appearance_count", 0))
+            cur_conf = _character_confidence(cur) or 0.0
+            new_conf = _character_confidence(c) or 0.0
+            if new_conf > cur_conf and c.get("thumbnail_url"):
+                cur["thumbnail_url"] = c.get("thumbnail_url")
+            # Keep the representative id stable, but preserve merged evidence.
+            cur_meta = cur.get("metadata") or {}
+            cur_meta["merged_sources"] = int(cur_meta.get("merged_sources", 1)) + 1
+            cur["metadata"] = cur_meta
+
+        chars = list(merged_named.values()) + unknown_rows
+
     chars = [_with_character_confidence(c) for c in chars]
     if sort_by == "name":
         chars.sort(key=lambda c: c["name"])
@@ -1095,6 +1935,9 @@ def update_character(character_id: str, req: CharacterUpdateRequest):
         raise HTTPException(404, "Character not found")
     if req.name is not None:
         char["name"] = req.name
+        meta = char.get("metadata") or {}
+        meta["auto_name"] = False
+        char["metadata"] = meta
     if req.description is not None:
         char["description"] = req.description
     _save_state()
@@ -1133,6 +1976,7 @@ def get_scene(scene_id: str):
 
 # ── Routes — Sessions ─────────────────────────────────────────────────────────
 
+@app.get("/api/sessions")
 @app.get("/api/sessions/")
 def list_sessions():
     return _sessions
@@ -1149,6 +1993,80 @@ def get_session(session_id: str):
 @app.get("/api/sessions/{session_id}/scenes")
 def get_session_scenes(session_id: str):
     return [s for s in _scenes if s["session_id"] == session_id]
+
+
+@app.post("/api/sessions/{session_id}/auto-name")
+def auto_name_session(session_id: str, anime_title: Optional[str] = Query(None)):
+    """Retroactively dedup + rename a session's characters using a supplied anime title."""
+    session = next((s for s in _sessions if s.get("id") == session_id), None)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    if anime_title and anime_title.strip():
+        session["title"] = anime_title.strip()
+
+    merged = _dedup_characters(session_id)
+    name_stats = _assign_names_for_session(session_id)
+    _save_state()
+
+    names = [
+        c.get("name")
+        for c in _characters
+        if (c.get("metadata") or {}).get("session_id") == session_id
+    ]
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "title": session.get("title"),
+        "merged": merged,
+        "naming": name_stats,
+        "character_count": len(names),
+        "names": names,
+    }
+
+
+@app.post("/api/sessions/auto-name-all")
+def auto_name_all_sessions(anime_title: Optional[str] = Query(None)):
+    """Bulk repair all sessions: dedup + model-assisted naming.
+
+    If anime_title is provided, it is applied only to generic session titles.
+    """
+    report: list[dict[str, Any]] = []
+    total_merged = 0
+    total_assigned = 0
+    total_unknown = 0
+
+    for s in _sessions:
+        sid = str(s.get("id") or "")
+        if not sid or sid.startswith("sess-"):
+            continue
+
+        title = str(s.get("title") or "")
+        if anime_title and _normalize_title(title) in GENERIC_SESSION_TITLES:
+            s["title"] = anime_title.strip()
+
+        merged = _dedup_characters(sid)
+        naming = _assign_names_for_session(sid)
+        total_merged += merged
+        total_assigned += int(naming.get("assigned", 0))
+        total_unknown += int(naming.get("unknown", 0))
+
+        report.append({
+            "session_id": sid,
+            "title": s.get("title"),
+            "merged": merged,
+            "naming": naming,
+        })
+
+    _save_state()
+    return {
+        "status": "ok",
+        "sessions": report,
+        "total_sessions": len(report),
+        "total_merged": total_merged,
+        "total_assigned": total_assigned,
+        "total_unknown": total_unknown,
+    }
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
@@ -1374,6 +2292,10 @@ def serve_data(path: str):
 
 # Load persisted state on startup.
 _load_state()
+_merged_at_startup = _purge_repeated_characters()
+if _merged_at_startup:
+    print(f"[startup] merged {_merged_at_startup} duplicate character(s)")
+    _save_state()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
