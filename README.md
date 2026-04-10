@@ -78,7 +78,17 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open the dashboard at http://localhost:3000
+Open the dashboard at http://localhost:3001
+
+By default this starts frontend + mock backend together (single command, no separate terminals).
+
+Optional full-ML services:
+
+```bash
+docker compose --profile ml up --build
+```
+
+This also starts ChromaDB and Ollama.
 
 ---
 
@@ -124,7 +134,7 @@ Have both frontend and backend running to see the full experience.
 
 | Service | URL |
 |---|---|
-| Dashboard | http://localhost:3000 |
+| Dashboard | http://localhost:3001 |
 | API + Swagger Docs | http://localhost:8000/docs |
 | ChromaDB UI | http://localhost:8100 |
 

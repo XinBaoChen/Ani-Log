@@ -141,6 +141,7 @@ export default function CharactersPage() {
                     introduced_at: char.first_seen_at,
                   },
                 }}
+                showTypeBadge={false}
                 onRename={(newName) => handleRename(char.id, newName)}
                 onDelete={() => handleDelete(char.id)}
               />

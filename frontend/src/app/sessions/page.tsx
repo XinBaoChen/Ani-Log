@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Film, Clock, LayoutGrid, ChevronRight, Loader2, Trash2 } from "lucide-react";
+import { Film, Clock, LayoutGrid, ChevronRight, Loader2, Trash2, Wand2 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Session } from "@/types";
 
@@ -29,6 +29,8 @@ export default function SessionsPage() {
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [namingId, setNamingId] = useState<string | null>(null);
+  const [fixingAll, setFixingAll] = useState(false);
 
   useEffect(() => {
     api
@@ -52,11 +54,59 @@ export default function SessionsPage() {
     }
   }
 
+  async function handleAutoName(id: string) {
+    const animeTitle = window.prompt(
+      "Enter anime title for this session (example: Karakai Jouzu no Takagi-san):"
+    );
+    if (!animeTitle || !animeTitle.trim()) return;
+
+    setNamingId(id);
+    try {
+      const res = await api.autoNameSession(id, animeTitle.trim());
+      setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title: res.title } : s)));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Auto-name failed: ${msg}`);
+    } finally {
+      setNamingId(null);
+    }
+  }
+
+  async function handleFixAllSessions() {
+    const animeTitle = window.prompt(
+      "Optional: enter anime title to apply to generic sessions only. Leave blank to keep each session title."
+    );
+
+    setFixingAll(true);
+    try {
+      const res = await api.autoNameAllSessions(animeTitle?.trim() || undefined);
+      setError(null);
+      alert(
+        `Fix complete. Sessions: ${res.total_sessions}\nMerged duplicates: ${res.total_merged}\nAssigned names: ${res.total_assigned}\nUnknown remaining: ${res.total_unknown}`
+      );
+      const refreshed = await api.getSessions();
+      setSessions(refreshed);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Fix-all failed: ${msg}`);
+    } finally {
+      setFixingAll(false);
+    }
+  }
+
   return (
     <div className="max-w-6xl mx-auto px-6 py-10">
       <div className="flex items-center gap-3 mb-8">
         <Film className="w-6 h-6 text-primary-400" />
         <h1 className="text-2xl font-bold text-surface-50">Capture Sessions</h1>
+        <button
+          onClick={handleFixAllSessions}
+          disabled={fixingAll}
+          className="ml-3 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-cyan-200 bg-cyan-500/15 border border-cyan-500/30 hover:bg-cyan-500/25 transition-all disabled:opacity-60"
+        >
+          {fixingAll ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Wand2 className="w-3.5 h-3.5" />}
+          Fix All Sessions
+        </button>
         {!loading && (
           <span className="ml-auto text-sm text-surface-500">
             {sessions.length} session{sessions.length !== 1 ? "s" : ""}
@@ -140,7 +190,15 @@ export default function SessionsPage() {
               </Link>
 
               {/* Delete controls — floated above the card link */}
-              <div className="absolute top-2 left-2 z-10">
+              <div className="absolute top-2 left-2 z-10 flex items-center gap-1.5">
+                <button
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleAutoName(s.id); }}
+                  disabled={namingId === s.id}
+                  className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-cyan-300 bg-black/70 border border-cyan-500/20 opacity-0 group-hover:opacity-100 hover:bg-cyan-500/20 hover:border-cyan-500/40 transition-all disabled:opacity-60"
+                >
+                  {namingId === s.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />}
+                  Auto-name
+                </button>
                 {!isConfirming ? (
                   <button
                     onClick={(e) => { e.preventDefault(); e.stopPropagation(); setConfirmId(s.id); }}

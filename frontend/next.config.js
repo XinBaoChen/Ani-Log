@@ -1,4 +1,8 @@
 /** @type {import('next').NextConfig} */
+const internalApiBase =
+  process.env.INTERNAL_API_URL ||
+  (process.env.NODE_ENV === "production" ? "http://backend:8000" : "http://localhost:8000");
+
 const nextConfig = {
   // Prevent Next.js from issuing 308 redirects on /api/* trailing slashes
   // (the backend defines some routes with trailing slashes like /api/sessions/)
@@ -16,11 +20,11 @@ const nextConfig = {
     return [
       {
         source: "/api/:path*",
-        destination: "http://localhost:8000/api/:path*",
+        destination: `${internalApiBase}/api/:path*`,
       },
       {
         source: "/data/:path*",
-        destination: "http://localhost:8000/data/:path*",
+        destination: `${internalApiBase}/data/:path*`,
       },
     ];
   },
