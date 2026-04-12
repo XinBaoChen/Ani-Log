@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { Session, Scene } from "@/types";
+import StoryArcSummary from "@/components/StoryArcSummary";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -645,6 +646,10 @@ export default function SessionDetailPage() {
                 })}
               </div>
             )}
+          </div>
+
+          <div className="shrink-0 bg-surface-950 border-t border-surface-800 px-3 pt-3 pb-4">
+            <StoryArcSummary sessionId={id} />
           </div>
         </>
       )}

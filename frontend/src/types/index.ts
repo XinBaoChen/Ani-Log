@@ -96,6 +96,7 @@ export interface CaptureStatus {
 // ─── Story Arc ──────────────────────────────────────────────
 export interface StoryArc {
   id: string;
+  session_id?: string;
   title: string;
   summary: string;
   character_ids: string[] | null;

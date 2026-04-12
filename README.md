@@ -128,6 +128,10 @@ uvicorn main:app --reload --port 8000
 cd backend
 python mock_server.py
 
+# Quick no-Docker smoke validation (run in a separate PowerShell while mock_server is running)
+cd backend
+.\manual_smoke_no_docker.ps1
+
 
 Have both frontend and backend running to see the full experience.
 ### Service URLs
@@ -257,17 +261,31 @@ Ani-Log/
 ### What Still Needs Completing (Before Stretch Goals)
 - [ ] Wire frontend to the full ML backend (`main.py`) — YOLO-World + CLIP + ChromaDB replacing the mock server
 - [ ] Validate the C++ capture engine build and ZeroMQ IPC bridge on a clean machine
-- [ ] Character rename UX — `PATCH /api/characters/{id}` exists on the backend; the UI input is not yet wired
-- [ ] Story arc summary panel — the Ollama LLM pipeline exists in `services/summarizer.py`; the frontend `StoryArcSummary` component is not yet connected
+- [x] Character rename UX — backend `PATCH /api/characters/{id}` is wired in the Characters UI
+- [x] Story arc summary panel — frontend `StoryArcSummary` is connected on Capture and Session Detail pages with session-scoped generation/listing
 - [ ] Semantic search — `GET /api/search?q=` routes exist but vector search is not plumbed into the search UI
 - [ ] Episode/series metadata — sessions need a title, episode number, and source field in the schema and UI
 - [ ] Scene detail modal — clicking a scene card should expand to full frame + character list + timestamp
 - [ ] End-to-end Docker Compose smoke test — confirm all services start cleanly together
 
+### Manual Validation Snapshot (No Docker)
+
+Validated locally on 2026-04-12 using:
+- Backend: `uvicorn mock_server:app --host 127.0.0.1 --port 8000`
+- Frontend: `npm --prefix frontend run dev -- --port 3001`
+
+Results:
+- ✅ Frontend routes load: `/` and `/sessions` returned HTTP 200
+- ✅ API proxy routes returned HTTP 200: `/api/capture/status`, `/api/sessions`, `/api/scenes`, `/api/summary`
+- ✅ End-to-end capture flow worked through frontend API path:
+    - `POST /api/capture/start` created a new session ID
+    - `POST /api/capture/stop` completed successfully
+    - New session was retrievable from `/api/sessions/{id}` and scene rows were returned from `/api/sessions/{id}/scenes`
+
 ### Immediate Next Steps (Execution Order)
 1. Run a full 30-minute stress test in both presets and capture memory profile over time (this update includes 20-second smoke baselines only).
 2. Add false-positive measurement harness for confidence thresholds using a labeled validation clip set.
-3. Surface dropped-frame and adaptive-skip counters in `/api/capture/status` to make preset behavior observable in real time.
+3. [x] Surface dropped-frame and adaptive-skip counters in `/api/capture/status` to make preset behavior observable in real time.
 4. Add CI perf guardrail script that fails if baseline thresholds regress by >20%.
 
 ### Stress Test Baseline (Completed)

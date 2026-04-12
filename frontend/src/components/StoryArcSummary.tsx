@@ -7,23 +7,31 @@ import { api } from "@/lib/api";
 import { useCaptureStore } from "@/store/useCaptureStore";
 import type { StoryArc } from "@/types";
 
-export default function StoryArcSummary() {
+interface StoryArcSummaryProps {
+  sessionId?: string;
+}
+
+export default function StoryArcSummary({ sessionId: fixedSessionId }: StoryArcSummaryProps) {
   const [arcs, setArcs] = useState<StoryArc[]>([]);
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const { sessionId } = useCaptureStore();
+  const [error, setError] = useState<string | null>(null);
+  const { sessionId: activeCaptureSessionId } = useCaptureStore();
+  const sessionId = fixedSessionId ?? activeCaptureSessionId ?? undefined;
 
   useEffect(() => {
     fetchArcs();
-  }, []);
+  }, [sessionId]);
 
   const fetchArcs = async () => {
     setLoading(true);
+    setError(null);
     try {
-      const data = await api.getStoryArcs(sessionId || undefined);
+      const data = await api.getStoryArcs(sessionId);
       setArcs(data);
     } catch (err) {
       console.error("Failed to fetch arcs:", err);
+      setError(err instanceof Error ? err.message : "Failed to fetch story arcs");
     } finally {
       setLoading(false);
     }
@@ -33,6 +41,7 @@ export default function StoryArcSummary() {
     if (!sessionId) return;
 
     setGenerating(true);
+    setError(null);
     try {
       const arc = await api.generateSummary({
         session_id: sessionId,
@@ -41,6 +50,7 @@ export default function StoryArcSummary() {
       setArcs((prev) => [arc, ...prev]);
     } catch (err) {
       console.error("Failed to generate summary:", err);
+      setError(err instanceof Error ? err.message : "Failed to generate summary");
     } finally {
       setGenerating(false);
     }
@@ -62,6 +72,7 @@ export default function StoryArcSummary() {
           <button
             onClick={generateSummary}
             disabled={generating || !sessionId}
+            title={sessionId ? "Generate summary" : "Start capture or open a specific session first"}
             className="btn-primary flex items-center gap-2 text-xs"
           >
             {generating ? (
@@ -79,6 +90,11 @@ export default function StoryArcSummary() {
           {[1, 2].map((i) => (
             <div key={i} className="h-24 rounded-xl bg-surface-800 animate-pulse" />
           ))}
+        </div>
+      ) : error ? (
+        <div className="text-center py-8">
+          <p className="text-sm text-red-400">{error}</p>
+          <button onClick={fetchArcs} className="btn-ghost mt-3 text-xs">Retry</button>
         </div>
       ) : arcs.length > 0 ? (
         <div className="space-y-4">
@@ -116,7 +132,9 @@ export default function StoryArcSummary() {
           <BookOpen className="w-8 h-8 text-surface-700 mx-auto mb-3" />
           <p className="text-sm text-surface-500">No story arcs yet</p>
           <p className="text-xs text-surface-600 mt-1">
-            Run a capture session, then generate a summary
+            {sessionId
+              ? "Generate a summary for this session"
+              : "Start a capture session or open Session Detail, then generate a summary"}
           </p>
         </div>
       )}

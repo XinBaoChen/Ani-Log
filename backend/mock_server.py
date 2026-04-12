@@ -45,6 +45,8 @@ _capture_state = {
     "session_id": None,
     "status": "idle",          # idle | capturing | stopped
     "total_frames": 0,
+    "skipped_frames": 0,
+    "error_frames": 0,
     "characters_found": 0,
     "scenes_detected": 0,
     "started_at": None,
@@ -1604,13 +1606,21 @@ def get_capture_status():
     if _capture_state["started_at"]:
         elapsed = int(time.time() - _capture_state["started_at"])
 
+    total_frames = int(_capture_state.get("total_frames", 0) or 0)
+    effective_fps = 0.0
+    if elapsed > 0:
+        effective_fps = float(total_frames) / float(elapsed)
+
     return {
         "session_id": _capture_state["session_id"] or "",
         "status": _capture_state["status"],
-        "total_frames": _capture_state["total_frames"],
+        "total_frames": total_frames,
+        "skipped_frames": int(_capture_state.get("skipped_frames", 0) or 0),
+        "error_frames": int(_capture_state.get("error_frames", 0) or 0),
         "characters_found": _capture_state["characters_found"],
         "scenes_detected": _capture_state["scenes_detected"],
         "elapsed_seconds": elapsed,
+        "effective_fps": round(effective_fps, 3),
     }
 
 def _capture_loop(
@@ -1668,6 +1678,7 @@ def _capture_loop(
                         last_saved_ts = now_ts
 
                 if not keep_frame:
+                    _capture_state["skipped_frames"] = int(_capture_state.get("skipped_frames", 0)) + 1
                     elapsed = time.monotonic() - t0
                     sleep_time = interval - elapsed
                     if sleep_time > 0:
@@ -1695,6 +1706,7 @@ def _capture_loop(
                 _capture_state["scenes_detected"] = frame_idx
                 _capture_state["characters_found"] = len(_capture_unique_characters)
             except Exception as e:
+                _capture_state["error_frames"] = int(_capture_state.get("error_frames", 0)) + 1
                 print(f"[capture] frame {frame_idx} error: {e}")
 
             # Sleep for remaining interval
@@ -1746,6 +1758,8 @@ def start_capture(req: CaptureStartRequest):
         "session_id": session_id,
         "status": "capturing",
         "total_frames": 0,
+        "skipped_frames": 0,
+        "error_frames": 0,
         "characters_found": 0,
         "scenes_detected": 0,
         "started_at": time.time(),
@@ -1779,13 +1793,20 @@ def stop_capture():
     # Stop the capture thread
     _capture_stop_event.set()
     if _capture_thread and _capture_thread.is_alive():
-        _capture_thread.join(timeout=3)
+        # Give the worker a short window to flush the latest counters.
+        for _ in range(25):
+            _capture_thread.join(timeout=0.2)
+            if not _capture_thread.is_alive():
+                break
     _capture_thread = None
 
     sid = _capture_state["session_id"]
     elapsed = int(time.time() - _capture_state["started_at"]) if _capture_state["started_at"] else 0
     total_frames = _capture_state["total_frames"]
+    skipped_frames = int(_capture_state.get("skipped_frames", 0) or 0)
+    error_frames = int(_capture_state.get("error_frames", 0) or 0)
     fps = _capture_state.get("fps", 2)
+    effective_fps = (float(total_frames) / float(max(1, elapsed))) if elapsed > 0 else 0.0
 
     # Build scene entries from actual captured screenshots
     _generate_real_scenes(sid, total_frames, fps)
@@ -1820,7 +1841,15 @@ def stop_capture():
     })
     _save_state()
 
-    return {"status": "stopped", "message": f"Capture stopped — {total_frames} frames saved"}
+    return {
+        "status": "stopped",
+        "message": f"Capture stopped — {total_frames} frames saved",
+        "total_frames": total_frames,
+        "skipped_frames": skipped_frames,
+        "error_frames": error_frames,
+        "elapsed_seconds": elapsed,
+        "effective_fps": round(effective_fps, 3),
+    }
 
 
 def _generate_real_scenes(session_id: str, total_frames: int, fps: int):
@@ -2151,7 +2180,7 @@ def search(
 @app.get("/api/summary")
 def list_story_arcs(session_id: Optional[str] = None):
     if session_id:
-        return [a for a in _story_arcs]  # all arcs for demo
+        return [a for a in _story_arcs if str(a.get("session_id", "")) == session_id]
     return _story_arcs
 
 @app.get("/api/summary/{arc_id}")
@@ -2163,12 +2192,25 @@ def get_story_arc(arc_id: str):
 
 @app.post("/api/summary/generate")
 def generate_summary(req: SummaryGenerateRequest):
+    session_scene_ids = [s["id"] for s in _scenes if s.get("session_id") == req.session_id]
+    selected_scene_ids = req.scene_ids or session_scene_ids[:6]
+
+    char_ids: list[str] = []
+    for sc in _scenes:
+        if sc.get("id") not in selected_scene_ids:
+            continue
+        for ch in sc.get("characters", []):
+            cid = str(ch.get("id", "")).strip()
+            if cid and cid not in char_ids:
+                char_ids.append(cid)
+
     new_arc = {
         "id": str(uuid.uuid4()),
+        "session_id": req.session_id,
         "title": f"Auto-generated Summary — Session {req.session_id[:8]}",
         "summary": "The episode opens with an ominous calm. Key characters converge on a fortified position as tensions escalate. A decisive confrontation follows, revealing long-hidden loyalties and setting the stage for an irreversible turning point in the narrative.",
-        "character_ids": [c["id"] for c in _characters[:4]],
-        "scene_ids": req.scene_ids or [s["id"] for s in _scenes[:3]],
+        "character_ids": char_ids[:8],
+        "scene_ids": selected_scene_ids,
         "generated_at": _now(),
     }
     _story_arcs.append(new_arc)
