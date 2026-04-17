@@ -13,6 +13,7 @@ Usage:
 import io
 import json
 import os
+import re
 import uuid
 import time
 import struct
@@ -2128,52 +2129,121 @@ def search(
     q: str = Query(...),
     category: str = Query("all"),
     limit: int = Query(20),
+    mode: str = Query("hybrid"),
+    min_score: float = Query(0.0),
 ):
+    mode = str(mode or "hybrid").strip().lower()
+    if mode not in {"hybrid", "semantic", "keyword"}:
+        mode = "hybrid"
+    min_score = _clamp01(float(min_score or 0.0))
+    limit = max(1, min(int(limit), 200))
+
+    synonyms = {
+        "girl": {"female", "woman", "lady"},
+        "boy": {"male", "man", "guy"},
+        "sword": {"blade", "katana"},
+        "fight": {"battle", "combat", "duel"},
+        "school": {"classroom", "student"},
+        "happy": {"smile", "joy", "cheerful"},
+        "angry": {"rage", "furious", "mad"},
+        "blue": {"azure", "cyan"},
+        "red": {"crimson", "scarlet"},
+    }
+
+    def tokenize(text: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+    def expand(tokens: set[str]) -> set[str]:
+        out = set(tokens)
+        for t in list(tokens):
+            out.update(synonyms.get(t, set()))
+        return out
+
+    q_l = q.lower().strip()
+    q_tokens = tokenize(q_l)
+    q_sem = expand(q_tokens)
+
+    def score_for_text(text: str) -> tuple[float, float, list[str]]:
+        t_l = (text or "").lower()
+        t_tokens = tokenize(t_l)
+        t_sem = expand(t_tokens)
+
+        if not q_tokens:
+            return 0.0, 0.0, []
+
+        exact_phrase = 1.0 if q_l and q_l in t_l else 0.0
+        token_hits = q_tokens.intersection(t_tokens)
+        token_ratio = len(token_hits) / max(1, len(q_tokens))
+        keyword_score = max(exact_phrase, min(1.0, 0.25 + 0.75 * token_ratio)) if token_hits or exact_phrase > 0 else 0.0
+
+        sem_hits = q_sem.intersection(t_sem)
+        semantic_score = len(sem_hits) / max(1, len(q_sem))
+
+        return keyword_score, semantic_score, sorted(token_hits)
+
+    def final_score(keyword_score: float, semantic_score: float) -> float:
+        if mode == "keyword":
+            return keyword_score
+        if mode == "semantic":
+            return semantic_score
+        return (0.62 * keyword_score) + (0.38 * semantic_score)
+
     results = []
 
     if category in ("all", "characters"):
         for c in _characters:
-            if _search_text(c, q):
-                results.append({
-                    "id": c["id"],
-                    "type": "character",
-                    "label": c["name"],
-                    "description": c["description"],
-                    "thumbnail_url": c["thumbnail_url"],
-                    "score": 0.92,
-                    "metadata": c.get("metadata"),
-                })
+            text = f"{c.get('name', '')} {c.get('description', '')}"
+            kw, sem, hits = score_for_text(text)
+            score = final_score(kw, sem)
+            if score < min_score or score <= 0:
+                continue
+            meta = dict(c.get("metadata") or {})
+            meta["match_mode"] = mode
+            meta["matched_terms"] = hits
+            meta["semantic_score"] = round(float(sem), 4)
+            meta["keyword_score"] = round(float(kw), 4)
+            results.append({
+                "id": c["id"],
+                "type": "character",
+                "label": c["name"],
+                "description": c.get("description"),
+                "thumbnail_url": c.get("thumbnail_url"),
+                "score": round(float(score), 4),
+                "metadata": meta,
+            })
 
     if category in ("all", "scenes"):
         for s in _scenes:
-            if _search_text(s, q):
-                results.append({
-                    "id": s["id"],
-                    "type": "scene",
-                    "label": s.get("location") or f"Scene {s['scene_index']+1}",
-                    "description": s.get("description"),
-                    "thumbnail_url": s.get("thumbnail_url"),
-                    "score": 0.78,
-                    "metadata": {"session_id": s["session_id"]},
-                })
+            text = f"{s.get('location', '')} {s.get('description', '')}"
+            kw, sem, hits = score_for_text(text)
+            score = final_score(kw, sem)
+            if score < min_score or score <= 0:
+                continue
+            meta = {
+                "session_id": s.get("session_id"),
+                "match_mode": mode,
+                "matched_terms": hits,
+                "semantic_score": round(float(sem), 4),
+                "keyword_score": round(float(kw), 4),
+            }
+            results.append({
+                "id": s["id"],
+                "type": "scene",
+                "label": s.get("location") or f"Scene {s.get('scene_index', 0) + 1}",
+                "description": s.get("description"),
+                "thumbnail_url": s.get("thumbnail_url"),
+                "score": round(float(score), 4),
+                "metadata": meta,
+            })
 
-    # Fuzzy fallback — partial word match
-    if not results:
-        q_parts = q.lower().split()
-        for c in _characters:
-            text = (c["name"] + " " + str(c.get("description", ""))).lower()
-            if any(p in text for p in q_parts):
-                results.append({
-                    "id": c["id"],
-                    "type": "character",
-                    "label": c["name"],
-                    "description": c["description"],
-                    "thumbnail_url": c["thumbnail_url"],
-                    "score": 0.55,
-                    "metadata": c.get("metadata"),
-                })
-
-    return {"query": q, "total": len(results), "results": results[:limit]}
+    results.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    clipped = results[:limit]
+    return {
+        "query": q,
+        "mode": mode,
+        "total": len(clipped),
+        "results": clipped,
+    }
 
 # ── Routes — Summary / Story Arcs ─────────────────────────────────────────────
 

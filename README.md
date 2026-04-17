@@ -81,6 +81,11 @@ docker compose up --build
 Open the dashboard at http://localhost:3001
 
 By default this starts frontend + mock backend together (single command, no separate terminals).
+Use only the dashboard URL for normal usage; all API routes are proxied through the frontend at `/api/*`.
+
+Docker persistence note:
+- Backend data is bind-mounted from `backend/data` into the container.
+- Existing `mock_state.json`, session folders, and local DB files from earlier runs are reused.
 
 Optional full-ML services:
 
@@ -89,6 +94,18 @@ docker compose --profile ml up --build
 ```
 
 This also starts ChromaDB and Ollama.
+
+Repeatable Docker smoke check (one command):
+
+```powershell
+./docker_smoke.ps1
+```
+
+If containers are already up and you only want validation (no compose up step):
+
+```powershell
+./docker_smoke.ps1 -SkipComposeUp
+```
 
 ---
 
@@ -263,10 +280,21 @@ Ani-Log/
 - [ ] Validate the C++ capture engine build and ZeroMQ IPC bridge on a clean machine
 - [x] Character rename UX — backend `PATCH /api/characters/{id}` is wired in the Characters UI
 - [x] Story arc summary panel — frontend `StoryArcSummary` is connected on Capture and Session Detail pages with session-scoped generation/listing
-- [ ] Semantic search — `GET /api/search?q=` routes exist but vector search is not plumbed into the search UI
+- [x] Semantic search UI — Search page now supports mode switching (`hybrid`/`semantic`/`keyword`) and score threshold filtering
 - [ ] Episode/series metadata — sessions need a title, episode number, and source field in the schema and UI
 - [ ] Scene detail modal — clicking a scene card should expand to full frame + character list + timestamp
-- [ ] End-to-end Docker Compose smoke test — confirm all services start cleanly together
+- [x] End-to-end Docker Compose smoke test — confirmed frontend pages, proxied APIs, semantic search modes, session-scoped summary generation, and persisted historical sessions in Docker
+
+### Docker Validation Snapshot
+
+Validated on 2026-04-16 using Docker Compose (`frontend` + `backend`) with dashboard-only testing via `http://localhost:3001`.
+
+Results:
+- ✅ Frontend routes returned HTTP 200: `/`, `/sessions`, `/search`, `/capture`
+- ✅ Proxied API routes returned HTTP 200 through frontend URL: `/api/capture/status`, `/api/sessions`, `/api/scenes`, `/api/characters`, `/api/summary`, `/api/search` (`hybrid`, `semantic`, `keyword`)
+- ✅ Historical persisted data visible in Docker after mount fix (`sessions_count=20` from existing local state)
+- ✅ End-to-end capture/session flow executes through frontend API path without proxy errors
+- ✅ Session-scoped story arc generation/filtering works through Docker proxy (`/api/summary/generate`, `/api/summary?session_id=...`)
 
 ### Manual Validation Snapshot (No Docker)
 

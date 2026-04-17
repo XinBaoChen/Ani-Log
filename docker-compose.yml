@@ -10,7 +10,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
-      - anilog-data:/app/data
+      - ./backend/data:/app/data
     environment:
       - ANI_LOG_CHROMA_HOST=chromadb
       - ANI_LOG_CHROMA_PORT=8000
@@ -70,7 +70,6 @@ services:
       - anilog-net
 
 volumes:
-  anilog-data:
   chroma-data:
   ollama-data:
 
