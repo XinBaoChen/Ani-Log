@@ -11,10 +11,18 @@ interface CaptureControlProps {
   fullView?: boolean;
 }
 
+function formatCaptureError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const cleaned = raw.replace(/^API Error\s+\d+:\s*/i, "").trim();
+  if (cleaned) return cleaned;
+  return "Failed to start capture.";
+}
+
 export default function CaptureControl({ fullView }: CaptureControlProps) {
   const { status, setStatus, setStats, setSessionId } = useCaptureStore();
   const [title, setTitle] = useState("");
   const [titleError, setTitleError] = useState<string | null>(null);
+  const [captureError, setCaptureError] = useState<string | null>(null);
   const [fps, setFps] = useState(2);
   const [preset, setPreset] = useState<"balanced" | "performance">("balanced");
   const [lastSessionId, setLastSessionId] = useState<string | null>(null);
@@ -64,6 +72,7 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
     }
 
     setTitleError(null);
+    setCaptureError(null);
     try {
       setStatus("starting");
       const isPerformance = preset === "performance";
@@ -79,6 +88,7 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
       pollStatus();
     } catch (err) {
       console.error("Failed to start capture:", err);
+      setCaptureError(formatCaptureError(err));
       setStatus("idle");
     }
   };
@@ -121,6 +131,9 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
           effectiveFps: data.effective_fps ?? 0,
           elapsed: data.elapsed_seconds,
         });
+        if (data.status === "capturing" && data.total_frames === 0 && data.last_error) {
+          setCaptureError(String(data.last_error));
+        }
         if (data.status === "capturing") {
           pollRef.current = setTimeout(tick, 1000);
         } else {
@@ -244,6 +257,12 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
           </p>
         </div>
       </div>
+
+      {captureError && (
+        <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2">
+          <p className="text-xs text-red-300">{captureError}</p>
+        </div>
+      )}
 
       {/* Control Buttons */}
       <div className="flex items-center gap-3">

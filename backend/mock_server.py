@@ -48,6 +48,7 @@ _capture_state = {
     "total_frames": 0,
     "skipped_frames": 0,
     "error_frames": 0,
+    "last_error": None,
     "characters_found": 0,
     "scenes_detected": 0,
     "started_at": None,
@@ -1618,11 +1619,38 @@ def get_capture_status():
         "total_frames": total_frames,
         "skipped_frames": int(_capture_state.get("skipped_frames", 0) or 0),
         "error_frames": int(_capture_state.get("error_frames", 0) or 0),
+        "last_error": _capture_state.get("last_error"),
         "characters_found": _capture_state["characters_found"],
         "scenes_detected": _capture_state["scenes_detected"],
         "elapsed_seconds": elapsed,
         "effective_fps": round(effective_fps, 3),
     }
+
+
+def _select_capture_monitor(monitors: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Pick a monitor definition that can be used by mss.grab."""
+    if len(monitors) > 1:
+        return monitors[1]
+    if len(monitors) == 1:
+        mon = monitors[0]
+        if int(mon.get("width", 0)) > 0 and int(mon.get("height", 0)) > 0:
+            return mon
+    return None
+
+
+def _preflight_capture_check() -> None:
+    """Fail fast when screen capture is unavailable (common in containerized runs)."""
+    try:
+        with mss.mss() as sct:
+            monitor = _select_capture_monitor(list(getattr(sct, "monitors", [])))
+            if monitor is None:
+                raise RuntimeError("No screen monitor is available for capture")
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"Screen capture unavailable in this environment: {e}. "
+            "If you are running in Docker, run the backend on the host for real screen capture.",
+        )
 
 def _capture_loop(
     session_id: str,
@@ -1647,76 +1675,85 @@ def _capture_loop(
     _recent_detections = []
     _pending_candidates[session_id] = []
 
-    with mss.mss() as sct:
-        monitor = sct.monitors[1]  # primary monitor
-        while not stop_event.is_set():
-            t0 = time.monotonic()
-            try:
-                if frame_idx >= MAX_CAPTURE_FRAMES:
-                    print(f"[capture] reached MAX_CAPTURE_FRAMES={MAX_CAPTURE_FRAMES}, stopping")
-                    stop_event.set()
-                    break
+    try:
+        with mss.mss() as sct:
+            monitor = _select_capture_monitor(list(getattr(sct, "monitors", [])))
+            if monitor is None:
+                raise RuntimeError("No screen monitor is available for capture")
 
-                raw = sct.grab(monitor)
-                img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-                # Resize to reasonable web size (max 1280 wide)
-                if img.width > 1280:
-                    ratio = 1280 / img.width
-                    img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
+            while not stop_event.is_set():
+                t0 = time.monotonic()
+                try:
+                    if frame_idx >= MAX_CAPTURE_FRAMES:
+                        print(f"[capture] reached MAX_CAPTURE_FRAMES={MAX_CAPTURE_FRAMES}, stopping")
+                        stop_event.set()
+                        break
 
-                keep_frame = True
-                if adaptive_keyframes:
-                    gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-                    small_gray = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
-                    now_ts = time.monotonic()
-                    if last_saved_gray is not None:
-                        diff = cv2.absdiff(small_gray, last_saved_gray)
-                        diff_score = float(np.mean(diff))
-                        due_keepalive = (now_ts - last_saved_ts) >= max_keyframe_gap_sec
-                        keep_frame = diff_score >= keyframe_threshold or due_keepalive
-                    if keep_frame:
-                        last_saved_gray = small_gray
-                        last_saved_ts = now_ts
+                    raw = sct.grab(monitor)
+                    img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                    # Resize to reasonable web size (max 1280 wide)
+                    if img.width > 1280:
+                        ratio = 1280 / img.width
+                        img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
 
-                if not keep_frame:
-                    _capture_state["skipped_frames"] = int(_capture_state.get("skipped_frames", 0)) + 1
-                    elapsed = time.monotonic() - t0
-                    sleep_time = interval - elapsed
-                    if sleep_time > 0:
-                        stop_event.wait(sleep_time)
-                    continue
+                    keep_frame = True
+                    if adaptive_keyframes:
+                        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+                        small_gray = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+                        now_ts = time.monotonic()
+                        if last_saved_gray is not None:
+                            diff = cv2.absdiff(small_gray, last_saved_gray)
+                            diff_score = float(np.mean(diff))
+                            due_keepalive = (now_ts - last_saved_ts) >= max_keyframe_gap_sec
+                            keep_frame = diff_score >= keyframe_threshold or due_keepalive
+                        if keep_frame:
+                            last_saved_gray = small_gray
+                            last_saved_ts = now_ts
 
-                path = session_dir / f"scene_{frame_idx:04d}.jpg"
-                img.save(str(path), "JPEG", quality=85)
+                    if not keep_frame:
+                        _capture_state["skipped_frames"] = int(_capture_state.get("skipped_frames", 0)) + 1
+                        elapsed = time.monotonic() - t0
+                        sleep_time = interval - elapsed
+                        if sleep_time > 0:
+                            stop_event.wait(sleep_time)
+                        continue
 
-                # Run detector every N saved frames in performance mode to reduce CPU spikes.
-                if frame_idx % max(1, detection_stride) == 0:
-                    try:
-                        char_ids = _detect_characters(session_id, frame_idx, img)
-                    except Exception as det_err:
-                        print(f"[detect] frame {frame_idx} error: {det_err}")
-                        char_ids = []
-                else:
-                    char_ids = _capture_frame_characters.get(frame_idx - 1, [])
-                _capture_frame_characters[frame_idx] = char_ids
-                for cid in char_ids:
-                    _capture_unique_characters.add(cid)
+                    path = session_dir / f"scene_{frame_idx:04d}.jpg"
+                    img.save(str(path), "JPEG", quality=85)
 
-                frame_idx += 1
-                _capture_state["total_frames"] = frame_idx
-                _capture_state["scenes_detected"] = frame_idx
-                _capture_state["characters_found"] = len(_capture_unique_characters)
-            except Exception as e:
-                _capture_state["error_frames"] = int(_capture_state.get("error_frames", 0)) + 1
-                print(f"[capture] frame {frame_idx} error: {e}")
+                    # Run detector every N saved frames in performance mode to reduce CPU spikes.
+                    if frame_idx % max(1, detection_stride) == 0:
+                        try:
+                            char_ids = _detect_characters(session_id, frame_idx, img)
+                        except Exception as det_err:
+                            print(f"[detect] frame {frame_idx} error: {det_err}")
+                            char_ids = []
+                    else:
+                        char_ids = _capture_frame_characters.get(frame_idx - 1, [])
+                    _capture_frame_characters[frame_idx] = char_ids
+                    for cid in char_ids:
+                        _capture_unique_characters.add(cid)
 
-            # Sleep for remaining interval
-            elapsed = time.monotonic() - t0
-            sleep_time = interval - elapsed
-            if sleep_time > 0:
-                stop_event.wait(sleep_time)
+                    frame_idx += 1
+                    _capture_state["total_frames"] = frame_idx
+                    _capture_state["scenes_detected"] = frame_idx
+                    _capture_state["characters_found"] = len(_capture_unique_characters)
+                except Exception as e:
+                    _capture_state["error_frames"] = int(_capture_state.get("error_frames", 0)) + 1
+                    _capture_state["last_error"] = str(e)
+                    print(f"[capture] frame {frame_idx} error: {e}")
 
-    _pending_candidates.pop(session_id, None)
+                # Sleep for remaining interval
+                elapsed = time.monotonic() - t0
+                sleep_time = interval - elapsed
+                if sleep_time > 0:
+                    stop_event.wait(sleep_time)
+    except Exception as e:
+        _capture_state["error_frames"] = int(_capture_state.get("error_frames", 0)) + 1
+        _capture_state["last_error"] = str(e)
+        print(f"[capture] capture loop terminated: {e}")
+    finally:
+        _pending_candidates.pop(session_id, None)
 
 
 @app.post("/api/capture/start")
@@ -1761,6 +1798,7 @@ def start_capture(req: CaptureStartRequest):
         "total_frames": 0,
         "skipped_frames": 0,
         "error_frames": 0,
+        "last_error": None,
         "characters_found": 0,
         "scenes_detected": 0,
         "started_at": time.time(),
@@ -1806,8 +1844,13 @@ def stop_capture():
     total_frames = _capture_state["total_frames"]
     skipped_frames = int(_capture_state.get("skipped_frames", 0) or 0)
     error_frames = int(_capture_state.get("error_frames", 0) or 0)
+    last_error = _capture_state.get("last_error")
     fps = _capture_state.get("fps", 2)
     effective_fps = (float(total_frames) / float(max(1, elapsed))) if elapsed > 0 else 0.0
+    generic_capture_error = (
+        "No frames were captured. Screen capture may be unavailable in this environment. "
+        "If using Docker, run backend on host Windows for real screen recording."
+    )
 
     # Build scene entries from actual captured screenshots
     _generate_real_scenes(sid, total_frames, fps)
@@ -1831,6 +1874,10 @@ def stop_capture():
             s["total_frames"] = total_frames
             scene_count = len([sc for sc in _scenes if sc["session_id"] == sid])
             s["scene_count"] = scene_count
+            if scene_count == 0 and total_frames == 0:
+                s["capture_error"] = str(last_error) if last_error else generic_capture_error
+            else:
+                s["capture_error"] = None
             if scene_count > 0:
                 s["first_thumbnail_url"] = f"/data/sessions/{sid}/scenes/scene_0000.jpg"
             break
@@ -1839,6 +1886,7 @@ def stop_capture():
         "status": "stopped",
         "session_id": None,
         "started_at": None,
+        "last_error": None,
     })
     _save_state()
 
@@ -1848,6 +1896,7 @@ def stop_capture():
         "total_frames": total_frames,
         "skipped_frames": skipped_frames,
         "error_frames": error_frames,
+        "last_error": str(last_error) if last_error else (generic_capture_error if total_frames == 0 else None),
         "elapsed_seconds": elapsed,
         "effective_fps": round(effective_fps, 3),
     }
