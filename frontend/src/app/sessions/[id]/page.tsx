@@ -486,7 +486,16 @@ export default function SessionDetailPage() {
         <div className="flex-1 flex flex-col items-center justify-center text-surface-500">
           <Film className="w-12 h-12 mb-4 opacity-30" />
           <p>No scenes captured yet.</p>
-          <p className="text-sm mt-1">Go to <strong>Capture</strong> and press Start while watching anime.</p>
+          {session?.capture_error ? (
+            <p className="text-sm mt-2 text-center max-w-2xl text-red-300">{session.capture_error}</p>
+          ) : (
+            <p className="text-sm mt-1">Go to <strong>Capture</strong> and press Start while watching anime.</p>
+          )}
+          {session?.total_frames === 0 && (
+            <p className="text-xs mt-2 text-center max-w-2xl text-surface-600">
+              If backend is running in Docker, desktop screen capture may not be available. Run backend on host Windows for real screen recording.
+            </p>
+          )}
         </div>
       ) : (
         <>

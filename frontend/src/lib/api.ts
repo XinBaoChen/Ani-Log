@@ -4,6 +4,7 @@
 
 import type {
   SearchResponse,
+  SearchOptions,
   Character,
   CharacterDetail,
   Scene,
@@ -36,10 +37,15 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   // ─── Search ─────────────────────────────────────────────
-  search: (query: string, category = "all", limit = 20) =>
-    request<SearchResponse>(
-      `/api/search?q=${encodeURIComponent(query)}&category=${category}&limit=${limit}`
-    ),
+  search: (query: string, options?: SearchOptions) => {
+    const params = new URLSearchParams();
+    params.set("q", query);
+    params.set("category", options?.category ?? "all");
+    params.set("limit", String(options?.limit ?? 20));
+    params.set("mode", options?.mode ?? "hybrid");
+    params.set("min_score", String(options?.minScore ?? 0));
+    return request<SearchResponse>(`/api/search?${params.toString()}`);
+  },
 
   // ─── Characters ─────────────────────────────────────────
   getCharacters: (params?: { sort_by?: string; limit?: number; offset?: number }) => {

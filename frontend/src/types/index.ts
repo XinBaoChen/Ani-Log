@@ -13,8 +13,18 @@ export interface SearchResult {
 
 export interface SearchResponse {
   query: string;
+  mode?: "hybrid" | "semantic" | "keyword";
   total: number;
   results: SearchResult[];
+}
+
+export type SearchMode = "hybrid" | "semantic" | "keyword";
+
+export interface SearchOptions {
+  category?: "all" | "characters" | "scenes" | "items";
+  limit?: number;
+  mode?: SearchMode;
+  minScore?: number;
 }
 
 // ─── Character ──────────────────────────────────────────────
@@ -87,6 +97,7 @@ export interface CaptureStatus {
   total_frames: number;
   skipped_frames?: number;
   error_frames?: number;
+  last_error?: string | null;
   characters_found: number;
   scenes_detected: number;
   elapsed_seconds: number;
@@ -122,4 +133,5 @@ export interface Session {
   capture_fps?: number | null;
   performance_mode?: boolean | null;
   adaptive_keyframes?: boolean | null;
+  capture_error?: string | null;
 }
