@@ -21,11 +21,15 @@ import { api } from "@/lib/api";
 import type { Session, Scene } from "@/types";
 import StoryArcSummary from "@/components/StoryArcSummary";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
-function thumb(url: string | null | undefined): string | null {
+function mediaUrl(url: string | null | undefined): string | null {
   if (!url) return null;
   return url.startsWith("http") ? url : `${API_BASE}${url}`;
+}
+
+function thumb(url: string | null | undefined): string | null {
+  return mediaUrl(url);
 }
 
 function fmtTime(sec: number): string {
@@ -70,6 +74,7 @@ export default function SessionDetailPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [autoplayDone, setAutoplayDone] = useState(false);
   const [minConfidence, setMinConfidence] = useState(0.5);
+  const [resolvedVideoUrl, setResolvedVideoUrl] = useState<string | null>(null);
   const viewerContainerRef = useRef<HTMLDivElement>(null);
 
   const scenesRef     = useRef<Scene[]>([]);
@@ -107,6 +112,40 @@ export default function SessionDetailPage() {
       .catch((e) => setError(String(e?.message ?? e)))
       .finally(() => setLoading(false));
   }, [id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const resolveVideo = async () => {
+      const explicit = mediaUrl(session?.video_url);
+      if (explicit) {
+        if (!cancelled) setResolvedVideoUrl(explicit);
+        return;
+      }
+
+      if (!session?.id) {
+        if (!cancelled) setResolvedVideoUrl(null);
+        return;
+      }
+
+      // Fallback for older backend payloads that don't include video_url yet.
+      const guessed = mediaUrl(`/data/sessions/${session.id}/preview.mp4`);
+      if (!guessed) {
+        if (!cancelled) setResolvedVideoUrl(null);
+        return;
+      }
+
+      try {
+        const res = await fetch(guessed, { method: "GET", cache: "no-store" });
+        if (!cancelled) setResolvedVideoUrl(res.ok ? guessed : null);
+      } catch {
+        if (!cancelled) setResolvedVideoUrl(null);
+      }
+    };
+
+    resolveVideo();
+    return () => { cancelled = true; };
+  }, [session?.id, session?.video_url]);
 
   // Preload scene images — prioritise first few for fast initial display
   useEffect(() => {
@@ -398,6 +437,7 @@ export default function SessionDetailPage() {
     );
 
   const scene     = scenes[current] ?? null;
+  const previewVideoUrl = resolvedVideoUrl;
   const canPlay   = scenes.length >= 2;
   const allLoaded = preloaded >= scenes.length;
   const stripScenes = scenes.filter((sc) => {
@@ -499,6 +539,18 @@ export default function SessionDetailPage() {
         </div>
       ) : (
         <>
+          {previewVideoUrl && (
+            <div className="shrink-0 border-b border-surface-800 bg-black">
+              <video
+                src={previewVideoUrl}
+                controls
+                playsInline
+                preload="metadata"
+                className="w-full max-h-[42vh] bg-black"
+              />
+            </div>
+          )}
+
           {/* Main viewer */}
           <div className="relative flex-1 min-h-0 bg-black select-none overflow-hidden flex items-center justify-center">
             {/* Blurred background */}

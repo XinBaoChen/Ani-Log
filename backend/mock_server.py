@@ -1640,6 +1640,13 @@ def _select_capture_monitor(monitors: list[dict[str, Any]]) -> Optional[dict[str
 
 def _preflight_capture_check() -> None:
     """Fail fast when screen capture is unavailable (common in containerized runs)."""
+    if os.name != "nt" and not os.environ.get("DISPLAY"):
+        raise HTTPException(
+            400,
+            "Screen capture unavailable: $DISPLAY is not set. "
+            "This Docker Linux backend cannot capture your Windows desktop. "
+            "Run backend on host Windows for real screen recording.",
+        )
     try:
         with mss.mss() as sct:
             monitor = _select_capture_monitor(list(getattr(sct, "monitors", [])))
@@ -1762,6 +1769,8 @@ def start_capture(req: CaptureStartRequest):
     if _capture_state["status"] == "capturing":
         raise HTTPException(400, "Capture session already running")
 
+    _preflight_capture_check()
+
     session_id = str(uuid.uuid4())
     new_session = {
         "id": session_id,
@@ -1772,6 +1781,7 @@ def start_capture(req: CaptureStartRequest):
         "total_frames": 0,
         "scene_count": 0,
         "first_thumbnail_url": None,
+        "video_url": None,
         "capture_fps": None,
         "performance_mode": None,
         "adaptive_keyframes": None,
@@ -1854,6 +1864,7 @@ def stop_capture():
 
     # Build scene entries from actual captured screenshots
     _generate_real_scenes(sid, total_frames, fps)
+    preview_video_url = _build_session_preview_video(sid, fps)
 
     # Merge characters that are too similar (same person, different crops)
     n_merged = _dedup_characters(sid)
@@ -1874,6 +1885,7 @@ def stop_capture():
             s["total_frames"] = total_frames
             scene_count = len([sc for sc in _scenes if sc["session_id"] == sid])
             s["scene_count"] = scene_count
+            s["video_url"] = preview_video_url
             if scene_count == 0 and total_frames == 0:
                 s["capture_error"] = str(last_error) if last_error else generic_capture_error
             else:
@@ -1897,6 +1909,7 @@ def stop_capture():
         "skipped_frames": skipped_frames,
         "error_frames": error_frames,
         "last_error": str(last_error) if last_error else (generic_capture_error if total_frames == 0 else None),
+        "video_url": preview_video_url,
         "elapsed_seconds": elapsed,
         "effective_fps": round(effective_fps, 3),
     }
@@ -1937,6 +1950,57 @@ def _generate_real_scenes(session_id: str, total_frames: int, fps: int):
             "characters": _get_character_refs(frame_char_ids),
             "items": [],
         })
+
+
+def _build_session_preview_video(session_id: str, fps: int) -> Optional[str]:
+    """Build a lightweight MP4 preview from captured frame JPGs."""
+    session_root = DATA_DIR / session_id
+    session_dir = session_root / "scenes"
+    if not session_dir.exists():
+        return None
+
+    files = sorted(session_dir.glob("scene_*.jpg"))
+    if not files:
+        return None
+
+    first = cv2.imread(str(files[0]))
+    if first is None:
+        return None
+
+    h, w = first.shape[:2]
+    if w < 2 or h < 2:
+        return None
+
+    # mp4 codecs often require even dimensions.
+    w = int(w - (w % 2))
+    h = int(h - (h % 2))
+    if w < 2 or h < 2:
+        return None
+
+    output_path = session_root / "preview.mp4"
+    target_fps = float(max(2, min(30, int(fps) if fps else 2)))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, target_fps, (w, h))
+    if not writer.isOpened():
+        return None
+
+    written = 0
+    try:
+        for fpath in files:
+            frame = cv2.imread(str(fpath))
+            if frame is None:
+                continue
+            if frame.shape[1] != w or frame.shape[0] != h:
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            writer.write(frame)
+            written += 1
+    finally:
+        writer.release()
+
+    if written == 0 or (not output_path.exists()) or output_path.stat().st_size <= 0:
+        return None
+
+    return f"/data/sessions/{session_id}/{output_path.name}"
 
 # ── Routes — Characters ───────────────────────────────────────────────────────
 
@@ -2445,7 +2509,13 @@ def serve_data(path: str):
         raise HTTPException(404, f"File not found: {path}")
     # Determine media type
     suffix = file_path.suffix.lower()
-    media_types = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+    media_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+    }
     media_type = media_types.get(suffix, "application/octet-stream")
     return FileResponse(str(file_path), media_type=media_type,
                         headers={"Cache-Control": "public, max-age=3600"})

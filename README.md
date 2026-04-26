@@ -107,6 +107,14 @@ If containers are already up and you only want validation (no compose up step):
 ./docker_smoke.ps1 -SkipComposeUp
 ```
 
+Windows real-capture mode (recommended if Docker backend cannot access desktop):
+
+```powershell
+./start_capture_hybrid.ps1
+```
+
+This runs backend on host Windows (`:8000`) and frontend in Docker (`:3001`) while keeping a single dashboard URL.
+
 ---
 
 ### Option B — Manual Setup (Windows-first)
