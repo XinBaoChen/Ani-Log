@@ -70,6 +70,8 @@ async def list_sessions(db: AsyncSession = Depends(get_db)):
             capture_fps=capture_cfg.get("fps"),
             performance_mode=capture_cfg.get("performance_mode"),
             adaptive_keyframes=capture_cfg.get("adaptive_keyframes"),
+            video_url=s.video_url,
+            capture_error=s.capture_error,
         ))
 
     return out
@@ -109,6 +111,8 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
         capture_fps=capture_cfg.get("fps"),
         performance_mode=capture_cfg.get("performance_mode"),
         adaptive_keyframes=capture_cfg.get("adaptive_keyframes"),
+        video_url=s.video_url,
+        capture_error=s.capture_error,
     )
 
 

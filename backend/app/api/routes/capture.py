@@ -2,12 +2,16 @@
 
 import asyncio
 import uuid
-from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from loguru import logger
 
-from app.models.schemas import CaptureStartRequest, CaptureStartResponse, CaptureStatusResponse
+from app.models.schemas import (
+    CaptureStartRequest,
+    CaptureStartResponse,
+    CaptureStatusResponse,
+    StopCaptureResponse,
+)
 from app.services.frame_processor import get_frame_processor
 from app.services.scene_analyzer import get_scene_analyzer
 from app.services.vector_store import get_vector_store
@@ -60,16 +64,23 @@ async def start_capture(request: CaptureStartRequest):
     )
 
 
-@router.post("/stop")
+@router.post("/stop", response_model=StopCaptureResponse)
 async def stop_capture():
     """Stop the current capture session."""
+    global _capture_task
+
     processor = get_frame_processor()
     if not processor.is_running:
         raise HTTPException(400, "No active capture session")
 
     await processor.stop_capture()
+    if _capture_task is not None:
+        try:
+            await _capture_task
+        finally:
+            _capture_task = None
 
-    return {"status": "stopped", "message": "Capture session stopped"}
+    return StopCaptureResponse(**processor.last_session_summary)
 
 
 @router.get("/status", response_model=CaptureStatusResponse)
@@ -92,6 +103,7 @@ async def get_status():
         total_frames=stats["frame_count"],
         skipped_frames=stats.get("skipped_frames", 0),
         error_frames=stats.get("error_frames", 0),
+        last_error=stats.get("last_error"),
         characters_found=characters_found,
         scenes_detected=scene_analyzer.scene_count,
         elapsed_seconds=stats["elapsed_seconds"],
