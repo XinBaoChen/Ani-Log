@@ -25,6 +25,8 @@ class CaptureSession(Base):
     ended_at = Column(DateTime, nullable=True)
     total_frames = Column(Integer, default=0)
     status = Column(String, default="idle")  # idle | capturing | processing | done
+    video_url = Column(String, nullable=True)
+    capture_error = Column(Text, nullable=True)
 
     scenes = relationship("Scene", back_populates="session", cascade="all, delete-orphan")
 
