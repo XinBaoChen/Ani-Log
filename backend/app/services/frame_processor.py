@@ -43,6 +43,8 @@ class FrameProcessor:
         self._frame_count = 0
         self._skipped_frames = 0
         self._error_frames = 0
+        self._last_error: str | None = None
+        self._last_session_summary: dict[str, object] = {}
         self._start_time = 0.0
         self._capture: mss.mss | None = None
         self._data_dir = settings.data_dir.resolve()   # always absolute
@@ -73,12 +75,17 @@ class FrameProcessor:
             "frame_count": self._frame_count,
             "skipped_frames": self._skipped_frames,
             "error_frames": self._error_frames,
+            "last_error": self._last_error,
             "elapsed_seconds": elapsed,
             "effective_fps": effective_fps,
             "fps": self._fps,
             "performance_mode": self._performance_mode,
             "adaptive_keyframes": self._adaptive_keyframes,
         }
+
+    @property
+    def last_session_summary(self) -> dict[str, object]:
+        return dict(self._last_session_summary)
 
     async def start_capture(
         self,
@@ -106,6 +113,8 @@ class FrameProcessor:
         self._frame_count = 0
         self._skipped_frames = 0
         self._error_frames = 0
+        self._last_error = None
+        self._last_session_summary = {}
         self._start_time = time.time()
         requested_fps = fps or settings.capture_fps
         self._performance_mode = bool(performance_mode)
@@ -154,6 +163,7 @@ class FrameProcessor:
             else:
                 await self._capture_loop(session_dir)
         except Exception as e:
+            self._last_error = str(e)
             logger.exception(f"Capture loop terminated with error: {e}")
         finally:
             self._running = False
@@ -181,6 +191,12 @@ class FrameProcessor:
 
     async def _finalise_db_session(self, session_id: str):
         """Mark the session as done and record end time / frame count."""
+        elapsed_seconds = max(0.0, time.time() - self._start_time)
+        effective_fps = (self._frame_count / elapsed_seconds) if elapsed_seconds > 0 else 0.0
+        last_error = self._last_error if self._frame_count == 0 else None
+        if last_error is None and self._frame_count == 0:
+            last_error = self._generic_capture_error()
+
         async with async_session() as db:
             from sqlalchemy import select
 
@@ -192,6 +208,7 @@ class FrameProcessor:
                 row.status = "done"
                 row.ended_at = datetime.utcnow()
                 row.total_frames = self._frame_count
+                row.capture_error = last_error
                 await db.commit()
 
         # Close final open scene if capture ended without another cut.
@@ -209,6 +226,27 @@ class FrameProcessor:
             await self._merge_session_character_duplicates(session_id)
         except Exception as exc:
             logger.warning(f"Duplicate merge post-processing skipped: {exc}")
+
+        self._last_session_summary = {
+            "status": "stopped",
+            "message": f"Capture stopped - {self._frame_count} frames saved",
+            "total_frames": self._frame_count,
+            "skipped_frames": self._skipped_frames,
+            "error_frames": self._error_frames,
+            "last_error": last_error,
+            "video_url": None,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "effective_fps": round(effective_fps, 3),
+        }
+        self._session_id = None
+        self._current_scene_id = None
+
+    @staticmethod
+    def _generic_capture_error() -> str:
+        return (
+            "No frames were captured. Screen capture may be unavailable in this environment. "
+            "If using Docker, run backend on host Windows for real screen recording."
+        )
 
     async def _persist_character(
         self, char_id: str, track: "Track", timestamp: float, session_dir: Path, frame: np.ndarray
@@ -474,6 +512,7 @@ class FrameProcessor:
         tracker = get_tracker()
         scene_analyzer = get_scene_analyzer()
         vector_store = get_vector_store()
+        current_frame_appearances: list[dict[str, object]] = []
 
         # 1. Detect scene change (or force a keyframe on a time interval)
         scene_changed = scene_analyzer.detect_scene_change(frame)
@@ -516,16 +555,15 @@ class FrameProcessor:
                     track.character_id = char_id
                     await self._persist_character(char_id, track, timestamp, session_dir, frame)
 
-                # Record appearance in current scene
-                if track.character_id and self._current_scene_id:
-                    await self._persist_appearance(
-                        character_id=track.character_id,
-                        scene_id=self._current_scene_id,
-                        timestamp=timestamp,
-                        confidence=person_detections[min(i, len(person_detections) - 1)].confidence
-                        if person_detections else 0.0,
-                        bbox=track.bbox,
-                    )
+                if track.character_id:
+                    current_frame_appearances.append({
+                        "character_id": track.character_id,
+                        "confidence": (
+                            person_detections[min(i, len(person_detections) - 1)].confidence
+                            if person_detections else 0.0
+                        ),
+                        "bbox": track.bbox,
+                    })
 
         # Update detections with track IDs
         for i, det in enumerate(person_detections):
@@ -537,6 +575,7 @@ class FrameProcessor:
                 det.track_id = matching_tracks[0].track_id
 
         # 6. Store scene data if scene changed → persist to both disk & SQLite
+        target_scene_id = self._current_scene_id
         if scene_changed:
             self._last_keyframe_time = timestamp
             thumbnail = scene_analyzer.extract_scene_thumbnail(frame)
@@ -570,6 +609,7 @@ class FrameProcessor:
                 description=description,
                 location=location,
             )
+            target_scene_id = new_scene_id
 
             # Add semantic embedding for scene search.
             try:
@@ -599,6 +639,16 @@ class FrameProcessor:
                 frame=frame,
                 timestamp=timestamp,
             )
+
+        if target_scene_id:
+            for appearance in current_frame_appearances:
+                await self._persist_appearance(
+                    character_id=str(appearance["character_id"]),
+                    scene_id=target_scene_id,
+                    timestamp=timestamp,
+                    confidence=float(appearance["confidence"]),
+                    bbox=list(appearance["bbox"]),
+                )
 
         self._frame_count += 1
 
@@ -643,6 +693,7 @@ class FrameProcessor:
                     await self.process_frame(frame, timestamp)
                 except Exception as frame_err:
                     self._error_frames += 1
+                    self._last_error = str(frame_err)
                     logger.warning(f"Frame {self._frame_count} processing error (skipping): {frame_err}")
 
                 # Maintain target FPS — only sleep if we have time left
@@ -693,6 +744,7 @@ class FrameProcessor:
                     analysis = await self.process_frame(frame, ts)
                 except Exception as frame_err:
                     self._error_frames += 1
+                    self._last_error = str(frame_err)
                     logger.warning(f"ZMQ frame processing error (skipping): {frame_err}")
                     continue
 

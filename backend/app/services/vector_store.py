@@ -47,12 +47,15 @@ class VectorStore:
         metadata: dict | None = None,
     ):
         """Store a character's CLIP embedding."""
-        self.characters.add(
-            ids=[character_id],
-            embeddings=[embedding.tolist()],
-            metadatas=[metadata or {}],
-        )
-        logger.debug(f"Added character embedding: {character_id}")
+        try:
+            self.characters.add(
+                ids=[character_id],
+                embeddings=[embedding.tolist()],
+                metadatas=[metadata or {}],
+            )
+            logger.debug(f"Added character embedding: {character_id}")
+        except Exception as exc:
+            logger.debug(f"Failed to add character embedding {character_id}: {exc}")
 
     def update_character_embedding(
         self,
@@ -61,11 +64,14 @@ class VectorStore:
         metadata: dict | None = None,
     ):
         """Update a character's embedding (running average)."""
-        self.characters.update(
-            ids=[character_id],
-            embeddings=[embedding.tolist()],
-            metadatas=[metadata or {}],
-        )
+        try:
+            self.characters.update(
+                ids=[character_id],
+                embeddings=[embedding.tolist()],
+                metadatas=[metadata or {}],
+            )
+        except Exception as exc:
+            logger.debug(f"Failed to update character embedding {character_id}: {exc}")
 
     def get_character_embedding(self, character_id: str) -> np.ndarray | None:
         """Fetch a single character embedding by ID."""
@@ -102,10 +108,14 @@ class VectorStore:
         """
         threshold = threshold or settings.reidentification_threshold
 
-        results = self.characters.query(
-            query_embeddings=[embedding.tolist()],
-            n_results=top_k,
-        )
+        try:
+            results = self.characters.query(
+                query_embeddings=[embedding.tolist()],
+                n_results=top_k,
+            )
+        except Exception as exc:
+            logger.debug(f"Character similarity query unavailable: {exc}")
+            return []
 
         matches = []
         if results["ids"] and results["ids"][0]:
@@ -129,11 +139,14 @@ class VectorStore:
         metadata: dict | None = None,
     ):
         """Store a scene's average CLIP embedding."""
-        self.scenes.add(
-            ids=[scene_id],
-            embeddings=[embedding.tolist()],
-            metadatas=[metadata or {}],
-        )
+        try:
+            self.scenes.add(
+                ids=[scene_id],
+                embeddings=[embedding.tolist()],
+                metadatas=[metadata or {}],
+            )
+        except Exception as exc:
+            logger.debug(f"Failed to add scene embedding {scene_id}: {exc}")
 
     # ─── Item Operations ─────────────────────────────────────
     def add_item(
@@ -143,11 +156,14 @@ class VectorStore:
         metadata: dict | None = None,
     ):
         """Store a detected item's embedding."""
-        self.items.add(
-            ids=[item_id],
-            embeddings=[embedding.tolist()],
-            metadatas=[metadata or {}],
-        )
+        try:
+            self.items.add(
+                ids=[item_id],
+                embeddings=[embedding.tolist()],
+                metadatas=[metadata or {}],
+            )
+        except Exception as exc:
+            logger.debug(f"Failed to add item embedding {item_id}: {exc}")
 
     # ─── Search Operations ───────────────────────────────────
     def search_by_text_embedding(
@@ -171,9 +187,9 @@ class VectorStore:
         embedding_list = [text_embedding.tolist()]
 
         collections = {
-            "characters": (self.characters, "character"),
-            "scenes": (self.scenes, "scene"),
-            "items": (self.items, "item"),
+            "characters": (lambda: self.characters, "character"),
+            "scenes": (lambda: self.scenes, "scene"),
+            "items": (lambda: self.items, "item"),
         }
 
         targets = collections if category == "all" else {category: collections.get(category)}
@@ -181,9 +197,10 @@ class VectorStore:
         for col_name, col_info in targets.items():
             if col_info is None:
                 continue
-            collection, entity_type = col_info
+            collection_getter, entity_type = col_info
 
             try:
+                collection = collection_getter()
                 query_results = collection.query(
                     query_embeddings=embedding_list,
                     n_results=limit,

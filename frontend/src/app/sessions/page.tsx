@@ -6,7 +6,7 @@ import { Film, Clock, LayoutGrid, ChevronRight, Loader2, Trash2, Wand2 } from "l
 import { api } from "@/lib/api";
 import type { Session } from "@/types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 function thumb(url: string | null) {
   if (!url) return null;

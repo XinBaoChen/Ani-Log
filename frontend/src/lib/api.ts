@@ -32,7 +32,16 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     throw new Error(`API Error ${res.status}: ${error}`);
   }
 
-  return res.json();
+  if (res.status === 204) {
+    return undefined as T;
+  }
+
+  const body = await res.text();
+  if (!body) {
+    return undefined as T;
+  }
+
+  return JSON.parse(body) as T;
 }
 
 export const api = {
@@ -135,7 +144,17 @@ export const api = {
     }),
 
   stopCapture: () =>
-    request<{ status: string; message: string }>("/api/capture/stop", {
+    request<{
+      status: string;
+      message: string;
+      total_frames: number;
+      skipped_frames: number;
+      error_frames: number;
+      last_error?: string | null;
+      video_url?: string | null;
+      elapsed_seconds: number;
+      effective_fps: number;
+    }>("/api/capture/stop", {
       method: "POST",
     }),
 

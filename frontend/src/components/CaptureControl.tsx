@@ -103,7 +103,10 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
     if (pollRef.current) clearTimeout(pollRef.current);
 
     try {
-      await api.stopCapture();
+      const response = await api.stopCapture();
+      if (response.last_error && response.total_frames === 0) {
+        setCaptureError(String(response.last_error));
+      }
     } catch (err: unknown) {
       // 400 "No active capture session" is fine — backend already stopped
       const msg = err instanceof Error ? err.message : String(err);
@@ -131,7 +134,7 @@ export default function CaptureControl({ fullView }: CaptureControlProps) {
           effectiveFps: data.effective_fps ?? 0,
           elapsed: data.elapsed_seconds,
         });
-        if (data.status === "capturing" && data.total_frames === 0 && data.last_error) {
+        if (data.total_frames === 0 && data.last_error) {
           setCaptureError(String(data.last_error));
         }
         if (data.status === "capturing") {
